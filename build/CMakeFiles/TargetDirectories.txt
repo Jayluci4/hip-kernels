@@ -1,0 +1,7 @@
+/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles/gptoss_kernels.dir
+/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles/gptoss_comm.dir
+/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles/gptoss_model.dir
+/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles/gptoss_engine.dir
+/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles/gptoss_python.dir
+/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles/edit_cache.dir
+/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles/rebuild_cache.dir

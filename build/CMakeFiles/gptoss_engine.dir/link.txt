@@ -1,0 +1,2 @@
+/usr/bin/ar qc libgptoss_engine.a CMakeFiles/gptoss_engine.dir/src/engine/engine.cu.o CMakeFiles/gptoss_engine.dir/src/engine/bridge.cu.o CMakeFiles/gptoss_engine.dir/src/engine/profiler.cu.o CMakeFiles/gptoss_engine.dir/src/memory/kv_cache_manager.cu.o CMakeFiles/gptoss_engine.dir/src/memory/weight_loader.cu.o
+/usr/bin/ranlib libgptoss_engine.a

@@ -1,0 +1,2 @@
+/usr/bin/ar qc libgptoss_comm.a CMakeFiles/gptoss_comm.dir/src/comm/nccl_manager.cu.o CMakeFiles/gptoss_comm.dir/src/comm/ep_comm.cu.o CMakeFiles/gptoss_comm.dir/src/comm/buffer_manager.cu.o
+/usr/bin/ranlib libgptoss_comm.a

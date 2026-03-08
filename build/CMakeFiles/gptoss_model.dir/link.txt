@@ -1,0 +1,2 @@
+/usr/bin/ar qc libgptoss_model.a CMakeFiles/gptoss_model.dir/src/model/transformer.cu.o CMakeFiles/gptoss_model.dir/src/model/moe_layer.cu.o CMakeFiles/gptoss_model.dir/src/model/attention.cu.o
+/usr/bin/ranlib libgptoss_model.a
