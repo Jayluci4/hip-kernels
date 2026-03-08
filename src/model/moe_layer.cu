@@ -906,50 +906,11 @@ private:
                                    mlp1_elements, compute_stream_);
             PROF_END(device_id_, compute_stream_);
 
-            // -- One-time weight diagnostic: layer 0, first batch --
-            if (layer_id_ == 0 && b == 0 && gpu_id_ == 0) {
-                CUDA_CHECK(hipStreamSynchronize(compute_stream_));
-                // Print first few dequantized W1 values and compute RMS
-                int diag_elems = min(2880, mlp1_elements); // first row
-                std::vector<__hip_bfloat16> w1_host(diag_elems);
-                CUDA_CHECK(hipMemcpy(w1_host.data(), stg.dequant[0][0],
-                    diag_elems * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                double sum_sq = 0;
-                for (int i = 0; i < diag_elems; i++) {
-                    float v = __bfloat162float(w1_host[i]);
-                    sum_sq += (double)v * v;
-                }
-                float w1_rms = (float)sqrt(sum_sq / diag_elems);
-                fprintf(stderr, "[WEIGHT DIAG L0] expert_id=%d (bi.expert_ids[0])\n", bi.expert_ids[0]);
-                fprintf(stderr, "[WEIGHT DIAG L0] W1 dequant first8=[%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f] rms=%.6f\n",
-                    __bfloat162float(w1_host[0]), __bfloat162float(w1_host[1]),
-                    __bfloat162float(w1_host[2]), __bfloat162float(w1_host[3]),
-                    __bfloat162float(w1_host[4]), __bfloat162float(w1_host[5]),
-                    __bfloat162float(w1_host[6]), __bfloat162float(w1_host[7]),
-                    w1_rms);
-                // Also print raw packed bytes and scale bytes for first block
-                uint8_t packed_bytes[16], scale_byte;
-                CUDA_CHECK(hipMemcpy(packed_bytes, expert_mlp1_[bi.expert_ids[0]].packed,
-                    16, hipMemcpyDeviceToHost));
-                CUDA_CHECK(hipMemcpy(&scale_byte, expert_mlp1_[bi.expert_ids[0]].scales,
-                    1, hipMemcpyDeviceToHost));
-                fprintf(stderr, "[WEIGHT DIAG L0] W1 raw packed[0..7]=[%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x] scale_byte=%d (2^%d = %.6f)\n",
-                    packed_bytes[0], packed_bytes[1], packed_bytes[2], packed_bytes[3],
-                    packed_bytes[4], packed_bytes[5], packed_bytes[6], packed_bytes[7],
-                    scale_byte, scale_byte - 127, ldexpf(1.0f, scale_byte - 127));
-                // Full W1 RMS (all elements)
-                int full_elems = min(mlp1_elements, 2880 * 10); // first 10 rows
-                std::vector<__hip_bfloat16> w1_full(full_elems);
-                CUDA_CHECK(hipMemcpy(w1_full.data(), stg.dequant[0][0],
-                    full_elems * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                double full_sq = 0;
-                for (int i = 0; i < full_elems; i++) {
-                    float v = __bfloat162float(w1_full[i]);
-                    full_sq += (double)v * v;
-                }
-                fprintf(stderr, "[WEIGHT DIAG L0] W1 first %d rows rms=%.6f\n",
-                    min(10, mlp1_elements / 2880), (float)sqrt(full_sq / full_elems));
-            }
+            // ROCm workaround: hipBLASLt may not properly respect stream
+            // ordering after custom HIP kernels on MI300X.  Record an event
+            // after dequant and wait on it before GEMM as a GPU-side barrier.
+            CUDA_CHECK(hipEventRecord(w1_dq_done_[0], compute_stream_));
+            CUDA_CHECK(hipStreamWaitEvent(compute_stream_, w1_dq_done_[0], 0));
 
             // -- Build MLP1 GEMM arrays --
             const __hip_bfloat16* mlp1_A[GROUPED_BATCH_SIZE];
@@ -965,6 +926,8 @@ private:
             }
 
             // -- Phase 1: Batch MLP1 GEMMs --
+            // DEBUG: Force sync before GEMM to test for stream race
+            CUDA_CHECK(hipStreamSynchronize(compute_stream_));
             PROF("w1_gemm", "moe_sub", device_id_, compute_stream_);
             cublas_compute_->gemm_bf16_lt_multi(
                 mlp1_A, mlp1_B, mlp1_C, mlp1_M,
@@ -1013,35 +976,9 @@ private:
                                    mlp2_elements, compute_stream_);
             PROF_END(device_id_, compute_stream_);
 
-            // -- Layer 0 diagnostic: gate_up output, swiglu output, W2 weights --
-            if (layer_id_ == 0 && b == 0 && gpu_id_ == 0 && bi.active_count > 0) {
-                CUDA_CHECK(hipStreamSynchronize(compute_stream_));
-                // gate_up output (first token, first 8 elements)
-                __hip_bfloat16 gu[8];
-                CUDA_CHECK(hipMemcpy(gu, stg.gate_up, 8 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                fprintf(stderr, "[WEIGHT DIAG L0] gate_up[0..7]=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
-                    __bfloat162float(gu[0]), __bfloat162float(gu[1]),
-                    __bfloat162float(gu[2]), __bfloat162float(gu[3]),
-                    __bfloat162float(gu[4]), __bfloat162float(gu[5]),
-                    __bfloat162float(gu[6]), __bfloat162float(gu[7]));
-                // swiglu output
-                __hip_bfloat16 sw[8];
-                CUDA_CHECK(hipMemcpy(sw, stg.swiglu, 8 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                fprintf(stderr, "[WEIGHT DIAG L0] swiglu[0..7]=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
-                    __bfloat162float(sw[0]), __bfloat162float(sw[1]),
-                    __bfloat162float(sw[2]), __bfloat162float(sw[3]),
-                    __bfloat162float(sw[4]), __bfloat162float(sw[5]),
-                    __bfloat162float(sw[6]), __bfloat162float(sw[7]));
-                // W2 dequantized weight RMS (first row)
-                __hip_bfloat16 w2h[2880];
-                CUDA_CHECK(hipMemcpy(w2h, stg.dequant[0][0], 2880 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                double w2sq = 0;
-                for (int i = 0; i < 2880; i++) { float v = __bfloat162float(w2h[i]); w2sq += (double)v*v; }
-                fprintf(stderr, "[WEIGHT DIAG L0] W2 dequant first8=[%.6f,%.6f,%.6f,%.6f] rms=%.6f\n",
-                    __bfloat162float(w2h[0]), __bfloat162float(w2h[1]),
-                    __bfloat162float(w2h[2]), __bfloat162float(w2h[3]),
-                    (float)sqrt(w2sq / 2880));
-            }
+            // ROCm workaround: same as W1 above
+            CUDA_CHECK(hipEventRecord(w2_dq_done_, compute_stream_));
+            CUDA_CHECK(hipStreamWaitEvent(compute_stream_, w2_dq_done_, 0));
 
             // -- Build MLP2 GEMM arrays (reads from bank[0]) --
             const __hip_bfloat16* mlp2_A[GROUPED_BATCH_SIZE];
@@ -1078,208 +1015,6 @@ private:
             }
             PROF_END(device_id_, compute_stream_);
 
-            // -- Layer 0 diagnostic: dump gate_up, swiglu, expert_out for expert 30 --
-            if (layer_id_ == 0 && gpu_id_ == 0 && num_tokens >= 72) {
-                for (int s = 0; s < bi.active_count; ++s) {
-                    if (bi.expert_ids[s] == 30) {
-                        CUDA_CHECK(hipStreamSynchronize(compute_stream_));
-                        // Find which token within this expert is token 0
-                        // Token 0's gather_map slot 0 should point to expert 30's segment
-                        int32_t gm0;
-                        CUDA_CHECK(hipMemcpy(&gm0, gather_map_, sizeof(int32_t), hipMemcpyDeviceToHost));
-                        int token_offset_in_expert = gm0 - bi.expert_starts[s]; // which row within the expert batch
-
-                        fprintf(stderr, "[E30 DIAG] expert_starts=%d, expert_count=%d, gate_up_offset=%d, token0_at_row=%d\n",
-                                bi.expert_starts[s], bi.expert_counts[s], bi.gate_up_offsets[s], token_offset_in_expert);
-
-                        // gate_up for token 0 within expert 30
-                        if (token_offset_in_expert >= 0 && token_offset_in_expert < bi.expert_counts[s]) {
-                            int gu_row = bi.gate_up_offsets[s] + token_offset_in_expert;
-                            __hip_bfloat16 gu[8];
-                            CUDA_CHECK(hipMemcpy(gu, stg.gate_up + static_cast<int64_t>(gu_row) * expert_gate_up_size,
-                                8 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                            fprintf(stderr, "[E30 DIAG] gate_up[0..7]=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
-                                __bfloat162float(gu[0]), __bfloat162float(gu[1]),
-                                __bfloat162float(gu[2]), __bfloat162float(gu[3]),
-                                __bfloat162float(gu[4]), __bfloat162float(gu[5]),
-                                __bfloat162float(gu[6]), __bfloat162float(gu[7]));
-
-                            // swiglu output for token 0
-                            int sw_row = bi.gate_up_offsets[s] + token_offset_in_expert;
-                            __hip_bfloat16 sw[8];
-                            CUDA_CHECK(hipMemcpy(sw, stg.swiglu + static_cast<int64_t>(sw_row) * expert_intermediate_size,
-                                8 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                            fprintf(stderr, "[E30 DIAG] swiglu[0..7]=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
-                                __bfloat162float(sw[0]), __bfloat162float(sw[1]),
-                                __bfloat162float(sw[2]), __bfloat162float(sw[3]),
-                                __bfloat162float(sw[4]), __bfloat162float(sw[5]),
-                                __bfloat162float(sw[6]), __bfloat162float(sw[7]));
-
-                            // expert output pos 5
-                            __hip_bfloat16 eo5;
-                            CUDA_CHECK(hipMemcpy(&eo5, expert_out_buf_ + static_cast<int64_t>(gm0) * hidden_size + 5,
-                                sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                            fprintf(stderr, "[E30 DIAG] expert_out pos5=%.6f\n", __bfloat162float(eo5));
-
-                            // expert output first 8
-                            __hip_bfloat16 eo8[8];
-                            CUDA_CHECK(hipMemcpy(eo8, expert_out_buf_ + static_cast<int64_t>(gm0) * hidden_size,
-                                8 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                            fprintf(stderr, "[E30 DIAG] expert_out first8=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
-                                __bfloat162float(eo8[0]), __bfloat162float(eo8[1]),
-                                __bfloat162float(eo8[2]), __bfloat162float(eo8[3]),
-                                __bfloat162float(eo8[4]), __bfloat162float(eo8[5]),
-                                __bfloat162float(eo8[6]), __bfloat162float(eo8[7]));
-
-                            // Also dump permuted_tokens at this position
-                            __hip_bfloat16 pt8[8];
-                            CUDA_CHECK(hipMemcpy(pt8, permuted_tokens_ + static_cast<int64_t>(gm0) * hidden_size,
-                                8 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                            fprintf(stderr, "[E30 DIAG] permuted_tokens first8=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
-                                __bfloat162float(pt8[0]), __bfloat162float(pt8[1]),
-                                __bfloat162float(pt8[2]), __bfloat162float(pt8[3]),
-                                __bfloat162float(pt8[4]), __bfloat162float(pt8[5]),
-                                __bfloat162float(pt8[6]), __bfloat162float(pt8[7]));
-
-                            // Dump W1 dequant first 8 values for expert 30
-                            __hip_bfloat16 w1_8[8];
-                            CUDA_CHECK(hipMemcpy(w1_8, stg.dequant[0][s],
-                                8 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                            fprintf(stderr, "[E30 DIAG] W1_dequant first8=[%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f]\n",
-                                __bfloat162float(w1_8[0]), __bfloat162float(w1_8[1]),
-                                __bfloat162float(w1_8[2]), __bfloat162float(w1_8[3]),
-                                __bfloat162float(w1_8[4]), __bfloat162float(w1_8[5]),
-                                __bfloat162float(w1_8[6]), __bfloat162float(w1_8[7]));
-
-                            // Dump raw packed bytes and scale byte
-                            uint8_t raw_packed[4], raw_scale;
-                            CUDA_CHECK(hipMemcpy(raw_packed, expert_mlp1_[30].packed,
-                                4, hipMemcpyDeviceToHost));
-                            CUDA_CHECK(hipMemcpy(&raw_scale, expert_mlp1_[30].scales,
-                                1, hipMemcpyDeviceToHost));
-                            fprintf(stderr, "[E30 DIAG] W1 raw packed[0..3]=[%02x,%02x,%02x,%02x] scale_byte=%d (2^%d = %.6f)\n",
-                                raw_packed[0], raw_packed[1], raw_packed[2], raw_packed[3],
-                                raw_scale, raw_scale - 127, ldexpf(1.0f, raw_scale - 127));
-                        }
-                        break;
-                    }
-                }
-            }
-
-            // -- Layer 0 diagnostic: expert output after MLP2 + bias --
-            if (layer_id_ == 0 && b == 0 && gpu_id_ == 0 && bi.active_count > 0) {
-                CUDA_CHECK(hipStreamSynchronize(compute_stream_));
-                __hip_bfloat16 eo[8];
-                CUDA_CHECK(hipMemcpy(eo, expert_out_buf_ + static_cast<int64_t>(bi.expert_starts[0]) * hidden_size,
-                    8 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                // RMS of first expert output
-                std::vector<__hip_bfloat16> eo_row(hidden_size);
-                CUDA_CHECK(hipMemcpy(eo_row.data(), expert_out_buf_ + static_cast<int64_t>(bi.expert_starts[0]) * hidden_size,
-                    hidden_size * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                double eo_sq = 0;
-                for (int i = 0; i < hidden_size; i++) { float v = __bfloat162float(eo_row[i]); eo_sq += (double)v*v; }
-                fprintf(stderr, "[WEIGHT DIAG L0] expert_out[0..7]=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f] rms=%.6f\n",
-                    __bfloat162float(eo[0]), __bfloat162float(eo[1]),
-                    __bfloat162float(eo[2]), __bfloat162float(eo[3]),
-                    __bfloat162float(eo[4]), __bfloat162float(eo[5]),
-                    __bfloat162float(eo[6]), __bfloat162float(eo[7]),
-                    (float)sqrt(eo_sq / hidden_size));
-                // Also print the bias for this expert
-                if (down_proj_bias_) {
-                    int global_e = bi.expert_ids[0] + gpu_id_ * experts_per_gpu;
-                    __hip_bfloat16 bp[8];
-                    CUDA_CHECK(hipMemcpy(bp, down_proj_bias_ + static_cast<int64_t>(global_e) * hidden_size,
-                        8 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                    fprintf(stderr, "[WEIGHT DIAG L0] down_proj_bias first8=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
-                        __bfloat162float(bp[0]), __bfloat162float(bp[1]),
-                        __bfloat162float(bp[2]), __bfloat162float(bp[3]),
-                        __bfloat162float(bp[4]), __bfloat162float(bp[5]),
-                        __bfloat162float(bp[6]), __bfloat162float(bp[7]));
-                }
-            }
-        }
-
-        // ----- L0 token0 expert output diagnostic -----
-        if (layer_id_ == 0 && gpu_id_ == 0 && num_tokens >= 72) {
-            CUDA_CHECK(hipStreamSynchronize(compute_stream_));
-            // Read gather_map and weights for token 0
-            int32_t gm[4];
-            float ew[4];
-            CUDA_CHECK(hipMemcpy(gm, gather_map_, 4 * sizeof(int32_t), hipMemcpyDeviceToHost));
-            CUDA_CHECK(hipMemcpy(ew, expert_weights_buf_, 4 * sizeof(float), hipMemcpyDeviceToHost));
-            fprintf(stderr, "[L0 T0 DIAG] gather_map=[%d,%d,%d,%d] weights=[%.4f,%.4f,%.4f,%.4f]\n",
-                    gm[0], gm[1], gm[2], gm[3], ew[0], ew[1], ew[2], ew[3]);
-
-            // Read expert output at each gather_map position, first 8 values + pos 5
-            for (int k = 0; k < 4; ++k) {
-                __hip_bfloat16 vals[8];
-                float pos5;
-                if (gm[k] >= 0) {
-                    size_t off = static_cast<size_t>(gm[k]) * hidden_size;
-                    CUDA_CHECK(hipMemcpy(vals, expert_out_buf_ + off, 8 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                    __hip_bfloat16 p5;
-                    CUDA_CHECK(hipMemcpy(&p5, expert_out_buf_ + off + 5, sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                    pos5 = __bfloat162float(p5);
-                } else {
-                    int ri = -(gm[k] + 1);
-                    size_t off = static_cast<size_t>(ri) * hidden_size;
-                    CUDA_CHECK(hipMemcpy(vals, recv_buffer_ + off, 8 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                    __hip_bfloat16 p5;
-                    CUDA_CHECK(hipMemcpy(&p5, recv_buffer_ + off + 5, sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                    pos5 = __bfloat162float(p5);
-                }
-                fprintf(stderr, "[L0 T0 DIAG] slot%d expert_out first4=[%.4f,%.4f,%.4f,%.4f] pos5=%.6f\n",
-                        k,
-                        __bfloat162float(vals[0]), __bfloat162float(vals[1]),
-                        __bfloat162float(vals[2]), __bfloat162float(vals[3]),
-                        pos5);
-            }
-
-            // Read residual token 0 first 8 + pos 5
-            __hip_bfloat16 res[8];
-            CUDA_CHECK(hipMemcpy(res, residual, 8 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-            __hip_bfloat16 res5;
-            CUDA_CHECK(hipMemcpy(&res5, residual + 5, sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-            fprintf(stderr, "[L0 T0 DIAG] residual first4=[%.4f,%.4f,%.4f,%.4f] pos5=%.6f\n",
-                    __bfloat162float(res[0]), __bfloat162float(res[1]),
-                    __bfloat162float(res[2]), __bfloat162float(res[3]),
-                    __bfloat162float(res5));
-
-            // Manual combine for pos 5
-            float manual_pos5 = __bfloat162float(res5);
-            for (int k = 0; k < 4; ++k) {
-                __hip_bfloat16 p5;
-                if (gm[k] >= 0) {
-                    CUDA_CHECK(hipMemcpy(&p5, expert_out_buf_ + static_cast<size_t>(gm[k]) * hidden_size + 5, sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                } else {
-                    int ri = -(gm[k] + 1);
-                    CUDA_CHECK(hipMemcpy(&p5, recv_buffer_ + static_cast<size_t>(ri) * hidden_size + 5, sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                }
-                manual_pos5 += ew[k] * __bfloat162float(p5);
-            }
-            fprintf(stderr, "[L0 T0 DIAG] manual_combine pos5=%.6f\n", manual_pos5);
-
-            // Also read normed input for token 0 first 8
-            __hip_bfloat16 ni[8];
-            CUDA_CHECK(hipMemcpy(ni, normed, 8 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-            fprintf(stderr, "[L0 T0 DIAG] normed_input first8=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
-                    __bfloat162float(ni[0]), __bfloat162float(ni[1]),
-                    __bfloat162float(ni[2]), __bfloat162float(ni[3]),
-                    __bfloat162float(ni[4]), __bfloat162float(ni[5]),
-                    __bfloat162float(ni[6]), __bfloat162float(ni[7]));
-
-            // Read permuted_tokens at gather_map positions to verify scatter
-            for (int k = 0; k < 4; ++k) {
-                if (gm[k] >= 0) {
-                    __hip_bfloat16 pt[8];
-                    size_t off = static_cast<size_t>(gm[k]) * hidden_size;
-                    CUDA_CHECK(hipMemcpy(pt, permuted_tokens_ + off, 8 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                    fprintf(stderr, "[L0 T0 DIAG] permuted_tokens[%d] first4=[%.4f,%.4f,%.4f,%.4f]\n",
-                            gm[k],
-                            __bfloat162float(pt[0]), __bfloat162float(pt[1]),
-                            __bfloat162float(pt[2]), __bfloat162float(pt[3]));
-                }
-            }
         }
 
         // ----- MoE internal diagnostics (layers 2-3, both GPUs) -----
