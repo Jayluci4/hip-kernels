@@ -9,6 +9,8 @@
 
 #include <hipblas/hipblas.h>
 #include <hipblaslt/hipblaslt.h>
+#include <hipblaslt/hipblaslt-ext.hpp>
+#include <vector>
 
 namespace gptoss {
 
@@ -383,6 +385,117 @@ struct CublasHandle {
                 workspace, workspace_size,
                 stream));
         }
+    }
+
+    // Grouped GEMM: single kernel launch for all experts.
+    // C[i] = A[i] * B[i]^T  (each with different M, shared N and K)
+    void gemm_bf16_grouped(
+        const __hip_bfloat16* const* A_array,
+        const __hip_bfloat16* const* B_array,
+        __hip_bfloat16* const* C_array,
+        const int* M_array,
+        int N, int K,
+        int count,
+        hipStream_t stream,
+        float alpha_val = 1.0f, float beta_val = 0.0f,
+        bool transB = false) const
+    {
+        if (count == 0) return;
+
+        // Filter out zero-M entries
+        int actual = 0;
+        for (int i = 0; i < count; i++)
+            if (M_array[i] > 0) actual++;
+        if (actual == 0) return;
+
+        // For single GEMM, fall through to individual call (less overhead)
+        if (actual == 1) {
+            gemm_bf16_lt_multi(A_array, B_array, C_array, M_array,
+                               N, K, count, stream, alpha_val, beta_val, transB);
+            return;
+        }
+
+        hipblasOperation_t opA = transB ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+        hipblasOperation_t opB = HIPBLAS_OP_N;
+
+        hipblaslt_ext::GroupedGemm groupedGemm(
+            lt_handle,
+            opA, opB,
+            HIP_R_16BF, HIP_R_16BF, HIP_R_16BF, HIP_R_16BF,
+            HIPBLAS_COMPUTE_32F);
+
+        std::vector<int64_t> m_vec, n_vec, k_vec, batch_vec;
+        std::vector<int64_t> lda_vec, ldb_vec, ldc_vec, ldd_vec;
+        std::vector<int64_t> strideA_vec, strideB_vec, strideC_vec, strideD_vec;
+        std::vector<hipblaslt_ext::GemmEpilogue> epilogue_vec;
+        std::vector<hipblaslt_ext::GemmInputs> inputs_vec;
+
+        for (int i = 0; i < count; i++) {
+            if (M_array[i] == 0) continue;
+
+            // hipBLASLt uses column-major: C = B * A where our row-major C = A * B^T
+            // In col-major terms: m=N, n=M, k=K
+            // A (our B, the weight): if transB, layout [K, N] with ld=K; else [N, K] with ld=N
+            // B (our A, activations): [K, M] with ld=K
+            // C: [N, M] with ld=N
+            int64_t cm = N;
+            int64_t cn = M_array[i];
+            int64_t ck = K;
+
+            m_vec.push_back(cm);
+            n_vec.push_back(cn);
+            k_vec.push_back(ck);
+            batch_vec.push_back(1);
+            lda_vec.push_back(transB ? ck : cm);  // A in col-major = our B
+            ldb_vec.push_back(ck);                 // B in col-major = our A
+            ldc_vec.push_back(cm);
+            ldd_vec.push_back(cm);
+            strideA_vec.push_back(0);
+            strideB_vec.push_back(0);
+            strideC_vec.push_back(0);
+            strideD_vec.push_back(0);
+
+            hipblaslt_ext::GemmEpilogue ep;
+            epilogue_vec.push_back(std::move(ep));
+
+            hipblaslt_ext::GemmInputs inp;
+            inp.setA(B_array[i]);  // col-major A = our B (weights)
+            inp.setB(A_array[i]);  // col-major B = our A (activations)
+            inp.setC(C_array[i]);
+            inp.setD(C_array[i]);
+            inp.setAlpha(&alpha_val);
+            inp.setBeta(&beta_val);
+            inputs_vec.push_back(std::move(inp));
+        }
+
+        hipblaslt_ext::GemmProblemType problemType(
+            opA, opB,
+            HIP_R_16BF, HIP_R_16BF, HIP_R_16BF, HIP_R_16BF,
+            HIPBLAS_COMPUTE_32F);
+
+        CUBLAS_CHECK(groupedGemm.setProblem(
+            m_vec, n_vec, k_vec, batch_vec,
+            lda_vec, ldb_vec, ldc_vec, ldd_vec,
+            strideA_vec, strideB_vec, strideC_vec, strideD_vec,
+            epilogue_vec, inputs_vec, problemType));
+
+        // Find algorithm
+        hipblaslt_ext::GemmPreference pref;
+        pref.setMaxWorkspaceBytes(workspace_size);
+
+        std::vector<hipblasLtMatmulHeuristicResult_t> heuristics;
+        CUBLAS_CHECK(groupedGemm.algoGetHeuristic(1, pref, heuristics));
+
+        if (heuristics.empty()) {
+            fprintf(stderr, "hipBLASLt GroupedGemm: no algorithm found!\n");
+            // Fallback to individual GEMMs
+            gemm_bf16_lt_multi(A_array, B_array, C_array, M_array,
+                               N, K, count, stream, alpha_val, beta_val, transB);
+            return;
+        }
+
+        CUBLAS_CHECK(groupedGemm.initialize(heuristics[0].algo, workspace, false, stream));
+        CUBLAS_CHECK(groupedGemm.run(stream));
     }
 };
 

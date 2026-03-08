@@ -20,6 +20,7 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <chrono>
 #include <rccl/rccl.h>
 
 #include "config.h"
@@ -117,6 +118,14 @@ extern void moe_layer_forward_prenormed(
     hipStream_t stream);
 
 extern const __hip_bfloat16* moe_layer_get_ffn_norm_weight(MoELayer* layer);
+
+extern void gemv_bf16_forward(
+    const __hip_bfloat16* input,
+    const __hip_bfloat16* weight,
+    __hip_bfloat16* output,
+    int N, int K,
+    hipStream_t stream,
+    const __hip_bfloat16* bias = nullptr);
 
 // ---------------------------------------------------------------------------
 // Embedding lookup kernel: token_ids -> embedding vectors
@@ -258,6 +267,7 @@ public:
     // ---- Capacity ----
     int max_tokens_;                     // Maximum tokens the scratch buffers can hold
     bool initialized_;
+    bool skip_moe_ = false;  // Set via env GPTOSS_SKIP_MOE=1 for models with zero-delta MoE
 
     // Constants
     static constexpr int num_layers = ModelConfig::num_layers;          // 36
@@ -347,6 +357,13 @@ public:
         allocate_buffers();
 
         initialized_ = true;
+
+        // Check env var for MoE skip mode (for models with zero-delta MoE)
+        const char* skip_env = getenv("GPTOSS_SKIP_MOE");
+        if (skip_env && (skip_env[0] == '1' || skip_env[0] == 'y' || skip_env[0] == 'Y')) {
+            skip_moe_ = true;
+            fprintf(stderr, "[Transformer] GPTOSS_SKIP_MOE=1: skipping MoE layers (zero-delta mode)\n");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -576,9 +593,6 @@ public:
         PROF_END(device_id_, stream);
 
         // Step 2: Forward through all 36 layers
-        // Fused path: attention outputs delta (no residual_add), then a single
-        // fused kernel computes residual[dst] = src + delta AND norm_out = RMSNorm(dst),
-        // saving 1 kernel launch + 1 memory pass per layer (~2.5us x 36 = ~90us).
         int src_buf = 0;
         for (int layer = 0; layer < num_layers; ++layer) {
             int dst_buf = 1 - src_buf;
@@ -623,18 +637,28 @@ public:
             PROF_END(device_id_, stream);
 
             // MoE: takes pre-normed input + residual for combine
-            PROF("moe_decode", "moe", device_id_, stream);
-            moe_layer_forward_prenormed(
-                moe_layers_[layer],
-                norm_out_buf_,
-                residual_buf_[dst_buf],
-                residual_buf_[src_buf],
-                num_seqs,
-                stream);
-            PROF_END(device_id_, stream);
+            if (!skip_moe_) {
+                PROF("moe_decode", "moe", device_id_, stream);
+                moe_layer_forward_prenormed(
+                    moe_layers_[layer],
+                    norm_out_buf_,
+                    residual_buf_[dst_buf],
+                    residual_buf_[src_buf],
+                    num_seqs,
+                    stream);
+                PROF_END(device_id_, stream);
+            } else {
+                // MoE produces zero delta for this model — just copy residual
+                CUDA_CHECK(hipMemcpyAsync(
+                    residual_buf_[src_buf], residual_buf_[dst_buf],
+                    static_cast<size_t>(num_seqs) * hidden_size * sizeof(__hip_bfloat16),
+                    hipMemcpyDeviceToDevice, stream));
+            }
 
-            // Barrier: same rationale as prefill loop
-            CUDA_CHECK(hipStreamSynchronize(stream));
+            // Barrier: needed for EP>1 to prevent RCCL communicator reuse across layers.
+            // For EP=1 (single GPU), MoE forward_core already drains both streams.
+            if constexpr (ModelConfig::ep_size > 1)
+                CUDA_CHECK(hipStreamSynchronize(stream));
 
             // Result is back in residual_buf_[src_buf]
         }
@@ -652,15 +676,16 @@ public:
         // Step 4: Column-sharded LM head GEMM
         // Each GPU: [num_seqs, 2880] x [2880, 100544] -> [num_seqs, 100544]
         PROF("lm_head_gemm", "gemm", device_id_, stream);
-        cublas_handle_->gemm_bf16_lt(
-            norm_out_buf_,       // A: [num_seqs, hidden_size=2880]
-            lm_head_weight_,     // B: HF layout [tp_vocab_size=100544, hidden_size=2880], transposed by hipBLAS
-            local_logits_buf_,   // C: [num_seqs, tp_vocab_size=100544]
-            num_seqs,            // M
-            tp_vocab_size,       // N = 100544
-            hidden_size,         // K = 2880
-            stream,
-            /*alpha=*/1.0f, /*beta=*/0.0f, /*bias=*/nullptr, /*transB=*/true);
+        if (num_seqs == 1) {
+            // Decode B=1: custom GEMV avoids ~1ms hipBLASLt CPU overhead
+            gemv_bf16_forward(norm_out_buf_, lm_head_weight_, local_logits_buf_,
+                              tp_vocab_size, hidden_size, stream);
+        } else {
+            cublas_handle_->gemm_bf16_lt(
+                norm_out_buf_, lm_head_weight_, local_logits_buf_,
+                num_seqs, tp_vocab_size, hidden_size, stream,
+                /*alpha=*/1.0f, /*beta=*/0.0f, /*bias=*/nullptr, /*transB=*/true);
+        }
         PROF_END(device_id_, stream);
 
         // Step 5: All-gather logits across TP GPUs

@@ -117,6 +117,23 @@ extern void moe_combine_forward(
     int num_tokens, int hidden_size, int top_k,
     hipStream_t stream);
 
+// Custom BF16 GEMV for M=1 decode -- replaces hipBLASLt overhead
+extern void gemv_bf16_forward(
+    const __hip_bfloat16* input,
+    const __hip_bfloat16* weight,
+    __hip_bfloat16* output,
+    int N, int K,
+    hipStream_t stream,
+    const __hip_bfloat16* bias = nullptr);
+
+extern void gemv_bf16_multi_forward(
+    const __hip_bfloat16* const* A_array,
+    const __hip_bfloat16* const* B_array,
+    __hip_bfloat16* const* C_array,
+    const int* M_array,
+    int N, int K, int count,
+    hipStream_t stream);
+
 extern void mxfp4_dequant(
     const uint8_t* packed,
     const uint8_t* scales,
@@ -136,6 +153,16 @@ extern void mxfp4_dequant_batched(
     int num_experts,
     int max_num_elements,
     hipStream_t stream);
+
+// Fused MXFP4 dequant + GEMV: reads FP4 directly, no staging buffer
+extern void fused_mxfp4_gemv_forward(
+    const __hip_bfloat16* input,
+    const uint8_t* packed_weights,
+    const uint8_t* scales,
+    __hip_bfloat16* output,
+    int N, int K,
+    hipStream_t stream,
+    const __hip_bfloat16* bias = nullptr);
 
 // ---------------------------------------------------------------------------
 // Bias-add kernel: adds a 1D bias vector to each row of a 2D matrix.
@@ -164,6 +191,169 @@ static void bias_add_rows(
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
     bias_add_rows_kernel<<<blocks, threads, 0, stream>>>(data, bias, rows, cols);
+}
+
+// ---------------------------------------------------------------------------
+// GPU-driven expert dispatch: reads expert_indices from device memory,
+// populates fused MXFP4 GEMV descriptors without any D2H.
+// ---------------------------------------------------------------------------
+struct FusedMxfp4GemvDesc {
+    const __hip_bfloat16* input;
+    const uint8_t* packed;
+    const uint8_t* scales;
+    __hip_bfloat16* output;
+    const __hip_bfloat16* bias;  // [N] or nullptr
+    int M;
+};
+
+extern void fused_mxfp4_gemv_multi_forward(
+    const FusedMxfp4GemvDesc* d_descs,
+    int N, int K, int count,
+    hipStream_t stream);
+
+extern void fused_mxfp4_gemv_multi_ptrs_forward(
+    const __hip_bfloat16* const* d_inputs,
+    const uint8_t* const* d_packed,
+    const uint8_t* const* d_scales,
+    __hip_bfloat16* const* d_outputs,
+    const __hip_bfloat16* const* d_biases,
+    int N, int K, int count,
+    hipStream_t stream);
+
+__global__ void build_fused_gemv_descs_kernel(
+    FusedMxfp4GemvDesc* __restrict__ descs,         // [top_k] output descriptors
+    const int32_t* __restrict__ expert_indices,      // [top_k] global expert IDs
+    const uint8_t* const* __restrict__ packed_table, // [experts_per_gpu] weight ptr table
+    const uint8_t* const* __restrict__ scales_table, // [experts_per_gpu] scale ptr table
+    const __hip_bfloat16* input,                     // shared input for all experts
+    __hip_bfloat16* output_base,                     // base output buffer
+    int output_stride,                               // elements per expert output
+    int gpu_id, int experts_per_gpu, int top_k)
+{
+    int k = threadIdx.x;
+    if (k >= top_k) return;
+
+    int global_e = expert_indices[k];
+    int local_e = global_e - gpu_id * experts_per_gpu;
+
+    descs[k].input = input;
+    descs[k].packed = packed_table[local_e];
+    descs[k].scales = scales_table[local_e];
+    descs[k].output = output_base + static_cast<int64_t>(k) * output_stride;
+    descs[k].M = 1;
+}
+
+// W2 variant: each expert has a different input (SwiGLU output at different offset)
+__global__ void build_fused_gemv_descs_w2_kernel(
+    FusedMxfp4GemvDesc* __restrict__ descs,
+    const int32_t* __restrict__ expert_indices,
+    const uint8_t* const* __restrict__ packed_table,
+    const uint8_t* const* __restrict__ scales_table,
+    const __hip_bfloat16* input_base,       // SwiGLU output base
+    int input_stride,                        // expert_intermediate_size
+    __hip_bfloat16* output_base,            // expert_out_buf base
+    int output_stride,                       // hidden_size
+    int gpu_id, int experts_per_gpu, int top_k)
+{
+    int k = threadIdx.x;
+    if (k >= top_k) return;
+
+    int global_e = expert_indices[k];
+    int local_e = global_e - gpu_id * experts_per_gpu;
+
+    descs[k].input = input_base + static_cast<int64_t>(k) * input_stride;
+    descs[k].packed = packed_table[local_e];
+    descs[k].scales = scales_table[local_e];
+    descs[k].output = output_base + static_cast<int64_t>(k) * output_stride;
+    descs[k].M = 1;
+}
+
+static void build_fused_gemv_descs(
+    FusedMxfp4GemvDesc* d_descs,
+    const int32_t* expert_indices,
+    const uint8_t* const* packed_table,
+    const uint8_t* const* scales_table,
+    const __hip_bfloat16* input,
+    __hip_bfloat16* output_base,
+    int output_stride,
+    int gpu_id, int experts_per_gpu, int top_k,
+    hipStream_t stream)
+{
+    build_fused_gemv_descs_kernel<<<1, top_k, 0, stream>>>(
+        d_descs, expert_indices, packed_table, scales_table,
+        input, output_base, output_stride, gpu_id, experts_per_gpu, top_k);
+}
+
+// ---------------------------------------------------------------------------
+// GPU-driven expert bias add for fast B=1 decode.
+// Reads expert_indices from device memory — no D2H needed.
+// ---------------------------------------------------------------------------
+__global__ void expert_bias_add_decode_kernel(
+    __hip_bfloat16* __restrict__ data,                // [top_k, dim] expert outputs
+    const __hip_bfloat16* __restrict__ bias_table,    // [num_experts, dim] all biases
+    const int32_t* __restrict__ expert_indices,       // [top_k] global expert IDs
+    int dim, int top_k)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= top_k * dim) return;
+
+    int k = idx / dim;
+    int d = idx % dim;
+    int global_e = expert_indices[k];
+
+    float val = __bfloat162float(data[idx]);
+    val += __bfloat162float(bias_table[static_cast<int64_t>(global_e) * dim + d]);
+    data[idx] = __float2bfloat16(val);
+}
+
+static void expert_bias_add_decode(
+    __hip_bfloat16* data,
+    const __hip_bfloat16* bias_table,
+    const int32_t* expert_indices,
+    int dim, int top_k,
+    hipStream_t stream)
+{
+    if (!bias_table) return;
+    int total = top_k * dim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    expert_bias_add_decode_kernel<<<blocks, threads, 0, stream>>>(
+        data, bias_table, expert_indices, dim, top_k);
+}
+
+// ---------------------------------------------------------------------------
+// Fast B=1 decode combine kernel: output = residual + sum_k(weight_k * expert_out_k)
+// For top_k=4 experts, each with 1 token output of hidden_size dimensions.
+// ---------------------------------------------------------------------------
+__global__ void moe_fast_combine_kernel(
+    __hip_bfloat16* __restrict__ output,           // [1, hidden_size]
+    const __hip_bfloat16* __restrict__ residual,   // [1, hidden_size]
+    const __hip_bfloat16* __restrict__ expert_outs, // [top_k, hidden_size] contiguous
+    const float* __restrict__ expert_weights,       // [top_k] routing weights
+    int hidden_size, int top_k)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= hidden_size) return;
+
+    float val = __bfloat162float(residual[idx]);
+    for (int k = 0; k < top_k; k++) {
+        val += expert_weights[k] * __bfloat162float(expert_outs[k * hidden_size + idx]);
+    }
+    output[idx] = __float2bfloat16(val);
+}
+
+static void moe_fast_combine(
+    __hip_bfloat16* output,
+    const __hip_bfloat16* residual,
+    const __hip_bfloat16* expert_outs,
+    const float* expert_weights,
+    int hidden_size, int top_k,
+    hipStream_t stream)
+{
+    int threads = 256;
+    int blocks = (hidden_size + threads - 1) / threads;
+    moe_fast_combine_kernel<<<blocks, threads, 0, stream>>>(
+        output, residual, expert_outs, expert_weights, hidden_size, top_k);
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +479,12 @@ public:
     MXFP4Weight* expert_mlp1_;  // Array of experts_per_gpu MXFP4Weight descriptors
     MXFP4Weight* expert_mlp2_;  // Array of experts_per_gpu MXFP4Weight descriptors
 
+    // Pre-dequantized BF16 weights for all local experts.
+    // Eliminates runtime dequant kernels + hipStreamSynchronize overhead.
+    // Memory: 128 experts × ~47.5 MB each ≈ 6.1 GB
+    __hip_bfloat16* expert_mlp1_bf16_[ModelConfig::experts_per_gpu] = {};
+    __hip_bfloat16* expert_mlp2_bf16_[ModelConfig::experts_per_gpu] = {};
+
     // ---- hipBLAS handles ----
     const CublasHandle* cublas_compute_;
     const CublasHandle* cublas_comm_;
@@ -351,6 +547,25 @@ public:
     // to avoid race conditions with pinned host memory DMA.
     MxFp4BatchDesc* d_dequant_descs_ = nullptr;   // device [GROUPED_BATCH_SIZE]
     MxFp4BatchDesc* h_dequant_descs_ = nullptr;    // pinned host [GROUPED_BATCH_SIZE]
+
+    // Device-side expert weight pointer tables for fast B=1 decode.
+    // Eliminates D2H of expert IDs — GPU kernel reads expert_indices from device
+    // memory and looks up weight pointers directly.
+    const uint8_t** d_mlp1_packed_ = nullptr;   // [experts_per_gpu] packed ptrs
+    const uint8_t** d_mlp1_scales_ = nullptr;   // [experts_per_gpu] scale ptrs
+    const uint8_t** d_mlp2_packed_ = nullptr;   // [experts_per_gpu]
+    const uint8_t** d_mlp2_scales_ = nullptr;   // [experts_per_gpu]
+    FusedMxfp4GemvDesc* d_fused_descs_ = nullptr; // [top_k] device descriptors
+    FusedMxfp4GemvDesc* h_fused_descs_ = nullptr; // [top_k] pinned host descriptors
+
+    // Pinned host pointer arrays for batched multi-expert GEMV.
+    // GPU reads these directly from host memory (zero-copy) — no memcpy needed.
+    // Only 5 × 8 × 8 = 320 bytes, so host-memory latency is negligible.
+    const __hip_bfloat16** h_gemv_inputs_ = nullptr;    // [GROUPED_BATCH_SIZE] pinned
+    const uint8_t** h_gemv_packed_ = nullptr;            // [GROUPED_BATCH_SIZE] pinned
+    const uint8_t** h_gemv_scales_ = nullptr;            // [GROUPED_BATCH_SIZE] pinned
+    __hip_bfloat16** h_gemv_outputs_ = nullptr;          // [GROUPED_BATCH_SIZE] pinned
+    const __hip_bfloat16** h_gemv_biases_ = nullptr;     // [GROUPED_BATCH_SIZE] pinned
 
     // Constants
     static constexpr int hidden_size = ModelConfig::hidden_size;
@@ -479,6 +694,41 @@ public:
             CUDA_CHECK(hipEventCreateWithFlags(&w1_dq_done_[i], hipEventDisableTiming));
         CUDA_CHECK(hipEventCreateWithFlags(&gemm1_done_, hipEventDisableTiming));
         CUDA_CHECK(hipEventCreateWithFlags(&w2_dq_done_, hipEventDisableTiming));
+
+        // expert_mlp1_bf16_ / expert_mlp2_bf16_ are NOT pre-allocated.
+        // Instead, we use shared staging buffers and restructured batching
+        // to minimize hipStreamSynchronize calls at runtime.
+
+        // Build device-side expert weight pointer tables for fast B=1 decode.
+        // Allows GPU kernels to look up expert weights without D2H of expert IDs.
+        {
+            const uint8_t* h_packed1[experts_per_gpu];
+            const uint8_t* h_scales1[experts_per_gpu];
+            const uint8_t* h_packed2[experts_per_gpu];
+            const uint8_t* h_scales2[experts_per_gpu];
+            for (int e = 0; e < static_cast<int>(experts_per_gpu); e++) {
+                h_packed1[e] = expert_mlp1[e].packed;
+                h_scales1[e] = expert_mlp1[e].scales;
+                h_packed2[e] = expert_mlp2[e].packed;
+                h_scales2[e] = expert_mlp2[e].scales;
+            }
+            CUDA_CHECK(hipMalloc(&d_mlp1_packed_, experts_per_gpu * sizeof(const uint8_t*)));
+            CUDA_CHECK(hipMalloc(&d_mlp1_scales_, experts_per_gpu * sizeof(const uint8_t*)));
+            CUDA_CHECK(hipMalloc(&d_mlp2_packed_, experts_per_gpu * sizeof(const uint8_t*)));
+            CUDA_CHECK(hipMalloc(&d_mlp2_scales_, experts_per_gpu * sizeof(const uint8_t*)));
+            CUDA_CHECK(hipMemcpy(d_mlp1_packed_, h_packed1, experts_per_gpu * sizeof(const uint8_t*), hipMemcpyHostToDevice));
+            CUDA_CHECK(hipMemcpy(d_mlp1_scales_, h_scales1, experts_per_gpu * sizeof(const uint8_t*), hipMemcpyHostToDevice));
+            CUDA_CHECK(hipMemcpy(d_mlp2_packed_, h_packed2, experts_per_gpu * sizeof(const uint8_t*), hipMemcpyHostToDevice));
+            CUDA_CHECK(hipMemcpy(d_mlp2_scales_, h_scales2, experts_per_gpu * sizeof(const uint8_t*), hipMemcpyHostToDevice));
+            CUDA_CHECK(hipMalloc(&d_fused_descs_, GROUPED_BATCH_SIZE * sizeof(FusedMxfp4GemvDesc)));
+            CUDA_CHECK(hipHostMalloc(&h_fused_descs_, GROUPED_BATCH_SIZE * sizeof(FusedMxfp4GemvDesc)));
+            // Pinned host pointer arrays for batched GEMV (zero-copy from GPU)
+            CUDA_CHECK(hipHostMalloc(&h_gemv_inputs_, GROUPED_BATCH_SIZE * sizeof(const __hip_bfloat16*)));
+            CUDA_CHECK(hipHostMalloc(&h_gemv_packed_, GROUPED_BATCH_SIZE * sizeof(const uint8_t*)));
+            CUDA_CHECK(hipHostMalloc(&h_gemv_scales_, GROUPED_BATCH_SIZE * sizeof(const uint8_t*)));
+            CUDA_CHECK(hipHostMalloc(&h_gemv_outputs_, GROUPED_BATCH_SIZE * sizeof(__hip_bfloat16*)));
+            CUDA_CHECK(hipHostMalloc(&h_gemv_biases_, GROUPED_BATCH_SIZE * sizeof(const __hip_bfloat16*)));
+        }
     }
 
     // ---- Cleanup ----
@@ -501,6 +751,13 @@ public:
         pinned_slots_capacity_ = 0;
         if (d_dequant_descs_) { CUDA_CHECK(hipFree(d_dequant_descs_)); d_dequant_descs_ = nullptr; }
         if (h_dequant_descs_) { CUDA_CHECK(hipHostFree(h_dequant_descs_)); h_dequant_descs_ = nullptr; }
+        if (d_fused_descs_) { CUDA_CHECK(hipFree(d_fused_descs_)); d_fused_descs_ = nullptr; }
+        if (h_fused_descs_) { CUDA_CHECK(hipHostFree(h_fused_descs_)); h_fused_descs_ = nullptr; }
+        if (h_gemv_inputs_) { CUDA_CHECK(hipHostFree(h_gemv_inputs_)); h_gemv_inputs_ = nullptr; }
+        if (h_gemv_packed_) { CUDA_CHECK(hipHostFree(h_gemv_packed_)); h_gemv_packed_ = nullptr; }
+        if (h_gemv_scales_) { CUDA_CHECK(hipHostFree(h_gemv_scales_)); h_gemv_scales_ = nullptr; }
+        if (h_gemv_outputs_) { CUDA_CHECK(hipHostFree(h_gemv_outputs_)); h_gemv_outputs_ = nullptr; }
+        if (h_gemv_biases_) { CUDA_CHECK(hipHostFree(h_gemv_biases_)); h_gemv_biases_ = nullptr; }
         if (dequant_stream_) {
             hipStreamDestroy(dequant_stream_);
             dequant_stream_ = nullptr;
@@ -510,6 +767,10 @@ public:
         }
         if (gemm1_done_) { hipEventDestroy(gemm1_done_); gemm1_done_ = nullptr; }
         if (w2_dq_done_) { hipEventDestroy(w2_dq_done_); w2_dq_done_ = nullptr; }
+        for (int e = 0; e < experts_per_gpu; ++e) {
+            if (expert_mlp1_bf16_[e]) { CUDA_CHECK(hipFree(expert_mlp1_bf16_[e])); expert_mlp1_bf16_[e] = nullptr; }
+            if (expert_mlp2_bf16_[e]) { CUDA_CHECK(hipFree(expert_mlp2_bf16_[e])); expert_mlp2_bf16_[e] = nullptr; }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -610,10 +871,15 @@ private:
             // --- Prefill path: compute on GPU 0, broadcast to all ---
             if (gpu_id_ == 0) {
                 PROF("router_gemm", "moe_sub", device_id_, compute_stream_);
-                cublas_compute_->gemm_bf16_lt(
-                    normed, router_weight_, router_logits_buf_,
-                    num_tokens, num_experts, hidden_size, compute_stream_,
-                    /*alpha=*/1.0f, /*beta=*/0.0f, /*bias=*/router_bias_, /*transB=*/true);
+                if (num_tokens == 1) {
+                    gemv_bf16_forward(normed, router_weight_, router_logits_buf_,
+                                      num_experts, hidden_size, compute_stream_, router_bias_);
+                } else {
+                    cublas_compute_->gemm_bf16_lt(
+                        normed, router_weight_, router_logits_buf_,
+                        num_tokens, num_experts, hidden_size, compute_stream_,
+                        /*alpha=*/1.0f, /*beta=*/0.0f, /*bias=*/router_bias_, /*transB=*/true);
+                }
                 PROF_END(device_id_, compute_stream_);
 
                 PROF("topk_softmax", "moe_sub", device_id_, compute_stream_);
@@ -664,10 +930,16 @@ private:
         } else {
             // --- Single-GPU path: no RCCL, compute locally ---
             PROF("router_gemm", "moe_sub", device_id_, compute_stream_);
-            cublas_compute_->gemm_bf16_lt(
-                normed, router_weight_, router_logits_buf_,
-                num_tokens, num_experts, hidden_size, compute_stream_,
-                /*alpha=*/1.0f, /*beta=*/0.0f, /*bias=*/router_bias_, /*transB=*/true);
+            if (num_tokens == 1) {
+                // Decode: custom GEMV avoids ~1ms hipBLASLt CPU overhead
+                gemv_bf16_forward(normed, router_weight_, router_logits_buf_,
+                                  num_experts, hidden_size, compute_stream_, router_bias_);
+            } else {
+                cublas_compute_->gemm_bf16_lt(
+                    normed, router_weight_, router_logits_buf_,
+                    num_tokens, num_experts, hidden_size, compute_stream_,
+                    /*alpha=*/1.0f, /*beta=*/0.0f, /*bias=*/router_bias_, /*transB=*/true);
+            }
             PROF_END(device_id_, compute_stream_);
 
             PROF("topk_softmax", "moe_sub", device_id_, compute_stream_);
@@ -679,95 +951,52 @@ private:
         }
 
         // -----------------------------------------------------------------
-        // Steps 4-5: Split permute pipeline (CPU gather_map)
-        //
-        // Three-phase approach eliminates the GPU single-thread serial scan
-        // bottleneck (137us at B=256 due to local memory spills) by moving
-        // position assignment to the CPU (~0.5us in L1 cache).
-        //
-        // Phase 1: GPU classify + count + prefix sums (~5us)
-        // Phase 2: D2H -> CPU gather_map -> H2D (~2us total)
-        // Phase 3: GPU scatter tokens (~10us)
-        //
-        // Total: ~17us vs ~137us with the old GPU single-thread kernel.
+        // Steps 4-5: Permute pipeline
         // -----------------------------------------------------------------
         const int total_slots = num_tokens * top_k;
+        int total_local_tokens;
 
-        // Ensure pinned slot buffers are large enough (lazy allocation)
-        if (total_slots > pinned_slots_capacity_) {
-            if (h_expert_indices_pinned_) CUDA_CHECK(hipHostFree(h_expert_indices_pinned_));
-            if (h_gather_map_pinned_) CUDA_CHECK(hipHostFree(h_gather_map_pinned_));
-            CUDA_CHECK(hipHostMalloc(&h_expert_indices_pinned_, total_slots * sizeof(int32_t)));
-            CUDA_CHECK(hipHostMalloc(&h_gather_map_pinned_, total_slots * sizeof(int32_t)));
-            pinned_slots_capacity_ = total_slots;
+        {
+            if (total_slots > pinned_slots_capacity_) {
+                if (h_expert_indices_pinned_) CUDA_CHECK(hipHostFree(h_expert_indices_pinned_));
+                if (h_gather_map_pinned_) CUDA_CHECK(hipHostFree(h_gather_map_pinned_));
+                CUDA_CHECK(hipHostMalloc(&h_expert_indices_pinned_, total_slots * sizeof(int32_t)));
+                CUDA_CHECK(hipHostMalloc(&h_gather_map_pinned_, total_slots * sizeof(int32_t)));
+                pinned_slots_capacity_ = total_slots;
+            }
+
+            PROF("permute", "moe_sub", device_id_, compute_stream_);
+            moe_permute_classify(
+                expert_indices_buf_, local_expert_counts_, per_peer_counts_,
+                expert_offsets_, peer_recv_offsets_,
+                num_tokens, top_k, gpu_id_, experts_per_gpu,
+                ModelConfig::ep_size, compute_stream_);
+
+            CUDA_CHECK(hipMemcpyAsync(h_expert_indices_pinned_, expert_indices_buf_,
+                total_slots * sizeof(int32_t), hipMemcpyDeviceToHost, compute_stream_));
+            CUDA_CHECK(hipMemcpyAsync(h_expert_offsets_pinned_, expert_offsets_,
+                (experts_per_gpu + 1) * sizeof(int32_t), hipMemcpyDeviceToHost, compute_stream_));
+            CUDA_CHECK(hipMemcpyAsync(h_per_peer_counts_pinned_, per_peer_counts_,
+                ModelConfig::ep_size * sizeof(int32_t), hipMemcpyDeviceToHost, compute_stream_));
+            CUDA_CHECK(hipMemcpyAsync(h_peer_recv_offsets_pinned_, peer_recv_offsets_,
+                ModelConfig::ep_size * sizeof(int32_t), hipMemcpyDeviceToHost, compute_stream_));
+
+            CUDA_CHECK(hipStreamSynchronize(compute_stream_));
+
+            moe_compute_gather_map_cpu(
+                h_expert_indices_pinned_, h_expert_offsets_pinned_,
+                h_peer_recv_offsets_pinned_, h_gather_map_pinned_,
+                total_slots, gpu_id_, experts_per_gpu);
+
+            CUDA_CHECK(hipMemcpyAsync(gather_map_, h_gather_map_pinned_,
+                total_slots * sizeof(int32_t), hipMemcpyHostToDevice, compute_stream_));
+
+            moe_scatter_tokens(normed, gather_map_, permuted_tokens_,
+                num_tokens, hidden_size, top_k, compute_stream_);
+            PROF_END(device_id_, compute_stream_);
+
+            total_local_tokens = h_expert_offsets_pinned_[experts_per_gpu];
         }
-
-        // Phase 1: GPU classify + count + prefix sums
-        PROF("permute", "moe_sub", device_id_, compute_stream_);
-        moe_permute_classify(
-            expert_indices_buf_,
-            local_expert_counts_,
-            per_peer_counts_,
-            expert_offsets_,
-            peer_recv_offsets_,
-            num_tokens, top_k, gpu_id_, experts_per_gpu,
-            ModelConfig::ep_size, compute_stream_);
-
-        // D2H: copy expert_indices, expert_offsets, per_peer_counts, peer_recv_offsets
-        CUDA_CHECK(hipMemcpyAsync(
-            h_expert_indices_pinned_,
-            expert_indices_buf_,
-            total_slots * sizeof(int32_t),
-            hipMemcpyDeviceToHost,
-            compute_stream_));
-        CUDA_CHECK(hipMemcpyAsync(
-            h_expert_offsets_pinned_,
-            expert_offsets_,
-            (experts_per_gpu + 1) * sizeof(int32_t),
-            hipMemcpyDeviceToHost,
-            compute_stream_));
-        CUDA_CHECK(hipMemcpyAsync(
-            h_per_peer_counts_pinned_,
-            per_peer_counts_,
-            ModelConfig::ep_size * sizeof(int32_t),
-            hipMemcpyDeviceToHost,
-            compute_stream_));
-        CUDA_CHECK(hipMemcpyAsync(
-            h_peer_recv_offsets_pinned_,
-            peer_recv_offsets_,
-            ModelConfig::ep_size * sizeof(int32_t),
-            hipMemcpyDeviceToHost,
-            compute_stream_));
-
-        // Single host sync -- the ONLY stall in the forward pass.
-        CUDA_CHECK(hipStreamSynchronize(compute_stream_));
-
-        // Phase 2: CPU gather_map computation (~0.5us)
-        // Counter arrays live in CPU L1 cache (~1ns/access) vs GPU local
-        // memory (~80 cycles/access). All EP ranks produce identical output.
-        moe_compute_gather_map_cpu(
-            h_expert_indices_pinned_,
-            h_expert_offsets_pinned_,
-            h_peer_recv_offsets_pinned_,
-            h_gather_map_pinned_,
-            total_slots, gpu_id_, experts_per_gpu);
-
-        // H2D: upload gather_map for GPU scatter + combine kernels
-        CUDA_CHECK(hipMemcpyAsync(
-            gather_map_,
-            h_gather_map_pinned_,
-            total_slots * sizeof(int32_t),
-            hipMemcpyHostToDevice,
-            compute_stream_));
-
-        // Phase 3: GPU scatter tokens into per-expert contiguous segments
-        moe_scatter_tokens(
-            normed, gather_map_, permuted_tokens_,
-            num_tokens, hidden_size, top_k, compute_stream_);
-        PROF_END(device_id_, compute_stream_);
-
-        // Now all pinned host arrays are valid from the sync above.
-        int total_local_tokens = h_expert_offsets_pinned_[experts_per_gpu];
 
         // -----------------------------------------------------------------
         // Step 5: Expert GEMMs -- Double-buffered dequant pipeline
@@ -787,7 +1016,27 @@ private:
         ensure_grouped_staging(device_id_, num_tokens * top_k);
         GroupedGemmStaging& stg = s_staging[device_id_];
 
-        // Pre-collect active experts for all batches (CPU-side, trivial)
+        // Collect ALL active experts into a flat list, then pack into
+        // dense batches of GROUPED_BATCH_SIZE.  During decode (top_k=4),
+        // this gives 1 batch of 4 experts instead of up to 4 batches of 1,
+        // reducing dequant+sync+GEMM cycles by ~4x.
+        struct ActiveExpert {
+            int expert_id;
+            int start;       // offset into permuted_tokens
+            int count;       // number of tokens assigned
+        };
+
+        ActiveExpert active_experts[ModelConfig::num_experts];  // max possible
+        int num_active = 0;
+
+        for (int e = 0; e < static_cast<int>(experts_per_gpu); ++e) {
+            int expert_start = h_expert_offsets_pinned_[e];
+            int expert_tokens = h_expert_offsets_pinned_[e + 1] - expert_start;
+            if (expert_tokens == 0) continue;
+            active_experts[num_active++] = {e, expert_start, expert_tokens};
+        }
+
+        // Pack active experts into dense batches
         struct BatchInfo {
             int active_count;
             int expert_ids[GROUPED_BATCH_SIZE];
@@ -797,168 +1046,201 @@ private:
             int total_tokens;
         };
 
-        constexpr int MAX_EXPERT_BATCHES = 16;  // 128 experts / 8 = max 16 (at ep_size=1)
+        constexpr int MAX_EXPERT_BATCHES = 16;  // 128 experts / 8 = max 16
         BatchInfo batch_infos[MAX_EXPERT_BATCHES];
         int num_batches = 0;
 
-        for (int batch_start = 0; batch_start < experts_per_gpu; batch_start += GROUPED_BATCH_SIZE) {
-            int batch_end = min(batch_start + GROUPED_BATCH_SIZE, static_cast<int>(experts_per_gpu));
+        for (int i = 0; i < num_active; i += GROUPED_BATCH_SIZE) {
             BatchInfo& bi = batch_infos[num_batches];
             bi.active_count = 0;
             bi.total_tokens = 0;
 
-            for (int e = batch_start; e < batch_end; ++e) {
-                int expert_start = h_expert_offsets_pinned_[e];
-                int expert_tokens = h_expert_offsets_pinned_[e + 1] - expert_start;
-                if (expert_tokens == 0) continue;
-
+            int batch_end = min(i + GROUPED_BATCH_SIZE, num_active);
+            for (int j = i; j < batch_end; ++j) {
                 int s = bi.active_count;
-                bi.expert_ids[s] = e;
-                bi.expert_starts[s] = expert_start;
-                bi.expert_counts[s] = expert_tokens;
+                bi.expert_ids[s] = active_experts[j].expert_id;
+                bi.expert_starts[s] = active_experts[j].start;
+                bi.expert_counts[s] = active_experts[j].count;
                 bi.gate_up_offsets[s] = bi.total_tokens;
-                bi.total_tokens += expert_tokens;
+                bi.total_tokens += active_experts[j].count;
                 bi.active_count++;
             }
 
             if (bi.active_count > 0) num_batches++;
         }
 
-        // No prolog needed -- W1 dequant is inlined at the top of each batch iteration.
-
-        // Main loop -- all dequant on compute_stream_ (no separate pipeline).
-        // This avoids race conditions where hipMemcpyAsync from pinned host
-        // memory is still in-flight when the CPU overwrites the host buffer.
+        // Main loop: fused MXFP4 GEMV (decode) or dequant → sync → GEMM (prefill).
+        // Dense batching ensures minimal batches (decode: 1 batch of 4 experts).
         for (int b = 0; b < num_batches; ++b) {
             BatchInfo& bi = batch_infos[b];
 
-            // -- W1 dequant on compute_stream_ --
-            PROF("w1_dequant", "moe_sub", device_id_, compute_stream_);
-            for (int s = 0; s < bi.active_count; ++s) {
-                int e = bi.expert_ids[s];
-                h_dequant_descs_[s] = {expert_mlp1_[e].packed, expert_mlp1_[e].scales,
-                                       stg.dequant[0][s], mlp1_elements};
-            }
-            // Use synchronous copy for the tiny descriptor buffer (~256 bytes).
-            // hipMemcpyAsync from pinned host memory defers the DMA read to
-            // GPU execution time.  The CPU loop overwrites h_dequant_descs_
-            // for the next batch before the GPU has consumed the previous one,
-            // causing the GPU to read stale/corrupted descriptors.  A sync
-            // copy completes the DMA before returning, making it safe to reuse
-            // the pinned buffer immediately.
-            CUDA_CHECK(hipMemcpy(d_dequant_descs_, h_dequant_descs_,
-                bi.active_count * sizeof(MxFp4BatchDesc),
-                hipMemcpyHostToDevice));
-            mxfp4_dequant_batched(d_dequant_descs_, bi.active_count,
-                                   mlp1_elements, compute_stream_);
-            PROF_END(device_id_, compute_stream_);
+            // Check if all experts in batch are M=1 (decode mode).
+            // If so, use fused MXFP4 GEMV — reads FP4 directly, no staging buffer.
+            bool all_decode = true;
+            for (int s = 0; s < bi.active_count; ++s)
+                if (bi.expert_counts[s] != 1) { all_decode = false; break; }
 
-            // ROCm workaround: hipBLASLt may not properly respect stream
-            // ordering after custom HIP kernels on MI300X.  Without this
-            // barrier the GEMM can read stale dequant buffers.
-            CUDA_CHECK(hipStreamSynchronize(compute_stream_));
+            if (all_decode) {
+                // ============================================================
+                // DECODE PATH: Fused MXFP4 GEMV (Phase 2)
+                // No dequant kernel, no staging buffer, no hipStreamSync.
+                // Reads FP4 packed weights + E8M0 scales → dequant in VGPRs → dot product.
+                // ============================================================
 
-            // -- Build MLP1 GEMM arrays --
-            const __hip_bfloat16* mlp1_A[GROUPED_BATCH_SIZE];
-            const __hip_bfloat16* mlp1_B[GROUPED_BATCH_SIZE];
-            __hip_bfloat16*       mlp1_C[GROUPED_BATCH_SIZE];
-            int                  mlp1_M[GROUPED_BATCH_SIZE];
-
-            for (int s = 0; s < bi.active_count; ++s) {
-                mlp1_A[s] = permuted_tokens_ + static_cast<int64_t>(bi.expert_starts[s]) * hidden_size;
-                mlp1_B[s] = stg.dequant[0][s];
-                mlp1_C[s] = stg.gate_up + static_cast<int64_t>(bi.gate_up_offsets[s]) * expert_gate_up_size;
-                mlp1_M[s] = bi.expert_counts[s];
-            }
-
-            // -- Phase 1: Batch MLP1 GEMMs --
-            // DEBUG: Force sync before GEMM to test for stream race
-            CUDA_CHECK(hipStreamSynchronize(compute_stream_));
-            PROF("w1_gemm", "moe_sub", device_id_, compute_stream_);
-            cublas_compute_->gemm_bf16_lt_multi(
-                mlp1_A, mlp1_B, mlp1_C, mlp1_M,
-                expert_gate_up_size, hidden_size,
-                bi.active_count, compute_stream_,
-                /*alpha=*/1.0f, /*beta=*/0.0f, /*transB=*/true);
-            PROF_END(device_id_, compute_stream_);
-
-            // -- Phase 1b: Add expert MLP1 biases --
-            PROF("bias_swiglu", "moe_sub", device_id_, compute_stream_);
-            if (gate_up_proj_bias_) {
+                // -- W1: fused MXFP4 GEMV (with bias fused) --
+                PROF("w1_fused_gemv", "moe_sub", device_id_, compute_stream_);
                 for (int s = 0; s < bi.active_count; ++s) {
-                    int global_e = bi.expert_ids[s] + gpu_id_ * experts_per_gpu;
-                    const __hip_bfloat16* bias = gate_up_proj_bias_
-                        + static_cast<int64_t>(global_e) * expert_gate_up_size;
-                    bias_add_rows(mlp1_C[s], bias, bi.expert_counts[s],
-                                  expert_gate_up_size, compute_stream_);
+                    int e = bi.expert_ids[s];
+                    const __hip_bfloat16* a = permuted_tokens_ + static_cast<int64_t>(bi.expert_starts[s]) * hidden_size;
+                    __hip_bfloat16* c = stg.gate_up + static_cast<int64_t>(bi.gate_up_offsets[s]) * expert_gate_up_size;
+                    const __hip_bfloat16* w1_bias = nullptr;
+                    if (gate_up_proj_bias_) {
+                        int global_e = e + gpu_id_ * experts_per_gpu;
+                        w1_bias = gate_up_proj_bias_ + static_cast<int64_t>(global_e) * expert_gate_up_size;
+                    }
+                    fused_mxfp4_gemv_forward(a, expert_mlp1_[e].packed, expert_mlp1_[e].scales,
+                                             c, expert_gate_up_size, hidden_size, compute_stream_,
+                                             w1_bias);
                 }
-            }
+                PROF_END(device_id_, compute_stream_);
 
-            // -- Phase 2: SwiGLU on all batch tokens at once --
-            swiglu_forward(
-                stg.gate_up, stg.swiglu,
-                bi.total_tokens, expert_intermediate_size,
-                swiglu_limit, compute_stream_);
-            PROF_END(device_id_, compute_stream_);
+                // -- SwiGLU (bias already fused into GEMV above) --
+                PROF("bias_swiglu", "moe_sub", device_id_, compute_stream_);
+                swiglu_forward(
+                    stg.gate_up, stg.swiglu,
+                    bi.total_tokens, expert_intermediate_size,
+                    swiglu_limit, compute_stream_);
+                PROF_END(device_id_, compute_stream_);
 
-            // -- W2 dequant on compute_stream_ --
-            PROF("w2_dequant", "moe_sub", device_id_, compute_stream_);
-            for (int s = 0; s < bi.active_count; ++s) {
-                int e = bi.expert_ids[s];
-                h_dequant_descs_[s] = {expert_mlp2_[e].packed, expert_mlp2_[e].scales,
-                                       stg.dequant[0][s], mlp2_elements};
-            }
-            // Use synchronous copy for the tiny descriptor buffer (~256 bytes).
-            // hipMemcpyAsync from pinned host memory defers the DMA read to
-            // GPU execution time.  The CPU loop overwrites h_dequant_descs_
-            // for the next batch before the GPU has consumed the previous one,
-            // causing the GPU to read stale/corrupted descriptors.  A sync
-            // copy completes the DMA before returning, making it safe to reuse
-            // the pinned buffer immediately.
-            CUDA_CHECK(hipMemcpy(d_dequant_descs_, h_dequant_descs_,
-                bi.active_count * sizeof(MxFp4BatchDesc),
-                hipMemcpyHostToDevice));
-            mxfp4_dequant_batched(d_dequant_descs_, bi.active_count,
-                                   mlp2_elements, compute_stream_);
-            PROF_END(device_id_, compute_stream_);
-
-            // ROCm workaround: same as W1 above
-            CUDA_CHECK(hipStreamSynchronize(compute_stream_));
-
-            // -- Build MLP2 GEMM arrays (reads from bank[0]) --
-            const __hip_bfloat16* mlp2_A[GROUPED_BATCH_SIZE];
-            const __hip_bfloat16* mlp2_B[GROUPED_BATCH_SIZE];
-            __hip_bfloat16*       mlp2_C[GROUPED_BATCH_SIZE];
-            int                  mlp2_M[GROUPED_BATCH_SIZE];
-
-            for (int s = 0; s < bi.active_count; ++s) {
-                mlp2_A[s] = stg.swiglu + static_cast<int64_t>(bi.gate_up_offsets[s]) * expert_intermediate_size;
-                mlp2_B[s] = stg.dequant[0][s];
-                mlp2_C[s] = expert_out_buf_ + static_cast<int64_t>(bi.expert_starts[s]) * hidden_size;
-                mlp2_M[s] = bi.expert_counts[s];
-            }
-
-            // -- Phase 4: Batch MLP2 GEMMs --
-            PROF("w2_gemm", "moe_sub", device_id_, compute_stream_);
-            cublas_compute_->gemm_bf16_lt_multi(
-                mlp2_A, mlp2_B, mlp2_C, mlp2_M,
-                hidden_size, expert_intermediate_size,
-                bi.active_count, compute_stream_,
-                /*alpha=*/1.0f, /*beta=*/0.0f, /*transB=*/true);
-            PROF_END(device_id_, compute_stream_);
-
-            // -- Phase 4b: Add expert MLP2 biases --
-            PROF("w2_bias", "moe_sub", device_id_, compute_stream_);
-            if (down_proj_bias_) {
+                // -- W2: fused MXFP4 GEMV (with bias fused) --
+                PROF("w2_fused_gemv", "moe_sub", device_id_, compute_stream_);
                 for (int s = 0; s < bi.active_count; ++s) {
-                    int global_e = bi.expert_ids[s] + gpu_id_ * experts_per_gpu;
-                    const __hip_bfloat16* bias = down_proj_bias_
-                        + static_cast<int64_t>(global_e) * hidden_size;
-                    bias_add_rows(mlp2_C[s], bias, bi.expert_counts[s],
-                                  hidden_size, compute_stream_);
+                    int e = bi.expert_ids[s];
+                    const __hip_bfloat16* a = stg.swiglu + static_cast<int64_t>(bi.gate_up_offsets[s]) * expert_intermediate_size;
+                    __hip_bfloat16* c = expert_out_buf_ + static_cast<int64_t>(bi.expert_starts[s]) * hidden_size;
+                    const __hip_bfloat16* w2_bias = nullptr;
+                    if (down_proj_bias_) {
+                        int global_e = e + gpu_id_ * experts_per_gpu;
+                        w2_bias = down_proj_bias_ + static_cast<int64_t>(global_e) * hidden_size;
+                    }
+                    fused_mxfp4_gemv_forward(a, expert_mlp2_[e].packed, expert_mlp2_[e].scales,
+                                             c, hidden_size, expert_intermediate_size, compute_stream_,
+                                             w2_bias);
                 }
+                PROF_END(device_id_, compute_stream_);
+
+            } else {
+                // ============================================================
+                // PREFILL PATH: dequant → sync → hipBLASLt GEMM (or GEMV for M=1)
+                // ============================================================
+
+                // -- W1 dequant --
+                PROF("w1_dequant", "moe_sub", device_id_, compute_stream_);
+                constexpr int mlp1_elements = hidden_size * expert_gate_up_size;
+                for (int s = 0; s < bi.active_count; ++s) {
+                    int e = bi.expert_ids[s];
+                    h_dequant_descs_[s].packed = expert_mlp1_[e].packed;
+                    h_dequant_descs_[s].scales = expert_mlp1_[e].scales;
+                    h_dequant_descs_[s].output = stg.dequant[0][s];
+                    h_dequant_descs_[s].num_elements = mlp1_elements;
+                }
+                CUDA_CHECK(hipMemcpy(d_dequant_descs_, h_dequant_descs_,
+                    bi.active_count * sizeof(MxFp4BatchDesc), hipMemcpyHostToDevice));
+                mxfp4_dequant_batched(d_dequant_descs_, bi.active_count,
+                                       mlp1_elements, compute_stream_);
+                PROF_END(device_id_, compute_stream_);
+
+                // hipBLASLt requires sync after custom dequant kernels (ROCm bug)
+                CUDA_CHECK(hipStreamSynchronize(compute_stream_));
+
+                // -- MLP1 GEMMs --
+                PROF("w1_gemm", "moe_sub", device_id_, compute_stream_);
+                for (int s = 0; s < bi.active_count; ++s) {
+                    const __hip_bfloat16* a = permuted_tokens_ + static_cast<int64_t>(bi.expert_starts[s]) * hidden_size;
+                    const __hip_bfloat16* b = stg.dequant[0][s];
+                    __hip_bfloat16* c = stg.gate_up + static_cast<int64_t>(bi.gate_up_offsets[s]) * expert_gate_up_size;
+                    if (bi.expert_counts[s] == 1) {
+                        gemv_bf16_forward(a, b, c, expert_gate_up_size, hidden_size, compute_stream_);
+                    } else {
+                        cublas_compute_->gemm_bf16_lt(
+                            a, b, c, bi.expert_counts[s],
+                            expert_gate_up_size, hidden_size,
+                            compute_stream_, 1.0f, 0.0f, /*bias=*/nullptr, /*transB=*/true);
+                    }
+                }
+                PROF_END(device_id_, compute_stream_);
+
+                // -- Add expert MLP1 biases + SwiGLU --
+                PROF("bias_swiglu", "moe_sub", device_id_, compute_stream_);
+                if (gate_up_proj_bias_) {
+                    for (int s = 0; s < bi.active_count; ++s) {
+                        int global_e = bi.expert_ids[s] + gpu_id_ * experts_per_gpu;
+                        const __hip_bfloat16* expert_bias = gate_up_proj_bias_
+                            + static_cast<int64_t>(global_e) * expert_gate_up_size;
+                        __hip_bfloat16* c_ptr = stg.gate_up + static_cast<int64_t>(bi.gate_up_offsets[s]) * expert_gate_up_size;
+                        bias_add_rows(c_ptr, expert_bias, bi.expert_counts[s],
+                                      expert_gate_up_size, compute_stream_);
+                    }
+                }
+
+                swiglu_forward(
+                    stg.gate_up, stg.swiglu,
+                    bi.total_tokens, expert_intermediate_size,
+                    swiglu_limit, compute_stream_);
+                PROF_END(device_id_, compute_stream_);
+
+                // -- W2 dequant --
+                PROF("w2_dequant", "moe_sub", device_id_, compute_stream_);
+                constexpr int mlp2_elements = expert_intermediate_size * hidden_size;
+                for (int s = 0; s < bi.active_count; ++s) {
+                    int e = bi.expert_ids[s];
+                    h_dequant_descs_[s].packed = expert_mlp2_[e].packed;
+                    h_dequant_descs_[s].scales = expert_mlp2_[e].scales;
+                    h_dequant_descs_[s].output = stg.dequant[0][s];
+                    h_dequant_descs_[s].num_elements = mlp2_elements;
+                }
+                CUDA_CHECK(hipMemcpy(d_dequant_descs_, h_dequant_descs_,
+                    bi.active_count * sizeof(MxFp4BatchDesc), hipMemcpyHostToDevice));
+                mxfp4_dequant_batched(d_dequant_descs_, bi.active_count,
+                                       mlp2_elements, compute_stream_);
+                PROF_END(device_id_, compute_stream_);
+
+                // hipBLASLt requires sync after custom dequant kernels
+                CUDA_CHECK(hipStreamSynchronize(compute_stream_));
+
+                // -- MLP2 GEMMs --
+                PROF("w2_gemm", "moe_sub", device_id_, compute_stream_);
+                for (int s = 0; s < bi.active_count; ++s) {
+                    const __hip_bfloat16* a = stg.swiglu + static_cast<int64_t>(bi.gate_up_offsets[s]) * expert_intermediate_size;
+                    const __hip_bfloat16* b = stg.dequant[0][s];
+                    __hip_bfloat16* c = expert_out_buf_ + static_cast<int64_t>(bi.expert_starts[s]) * hidden_size;
+                    if (bi.expert_counts[s] == 1) {
+                        gemv_bf16_forward(a, b, c, hidden_size, expert_intermediate_size, compute_stream_);
+                    } else {
+                        cublas_compute_->gemm_bf16_lt(
+                            a, b, c, bi.expert_counts[s],
+                            hidden_size, expert_intermediate_size,
+                            compute_stream_, 1.0f, 0.0f, /*bias=*/nullptr, /*transB=*/true);
+                    }
+                }
+                PROF_END(device_id_, compute_stream_);
             }
-            PROF_END(device_id_, compute_stream_);
+
+            // -- Add expert MLP2 biases (prefill path only; decode path fuses bias into GEMV) --
+            if (!all_decode) {
+                PROF("w2_bias", "moe_sub", device_id_, compute_stream_);
+                if (down_proj_bias_) {
+                    for (int s = 0; s < bi.active_count; ++s) {
+                        int global_e = bi.expert_ids[s] + gpu_id_ * experts_per_gpu;
+                        const __hip_bfloat16* expert_bias = down_proj_bias_
+                            + static_cast<int64_t>(global_e) * hidden_size;
+                        __hip_bfloat16* c_ptr = expert_out_buf_ + static_cast<int64_t>(bi.expert_starts[s]) * hidden_size;
+                        bias_add_rows(c_ptr, expert_bias, bi.expert_counts[s],
+                                      hidden_size, compute_stream_);
+                    }
+                }
+                PROF_END(device_id_, compute_stream_);
+            }
 
         }
 

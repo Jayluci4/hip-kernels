@@ -662,7 +662,7 @@ void paged_attention_forward(
     const size_t bt_smem = bt_entries * sizeof(int32_t);
     const size_t smem_bytes = vk_smem + reduce_smem + bt_smem;
 
-    // Adaptive splitK selection
+    // Adaptive splitK selection — target ~304 blocks for MI300X (304 CUs)
     int kv_blocks;
     if (window_size > 0) {
         kv_blocks = cdiv(window_size, block_size);
@@ -671,17 +671,14 @@ void paged_attention_forward(
     }
 
     int splitK = 1;
-    if (partial_out != nullptr && max_splitK > 1) {
-        // MI300X: 304 CUs. Adjust thresholds accordingly.
-        int total_blocks = num_kv_heads * num_seqs;
-        if (total_blocks <= 128 && kv_blocks > 4) {
-            if (kv_blocks > 32)      splitK = 8;
-            else if (kv_blocks > 12) splitK = 4;
-            else                     splitK = 2;
-            splitK = min(splitK, max_splitK);
-            while (splitK > 1 && total_blocks * splitK > 2048)
-                splitK /= 2;
-        }
+    if (partial_out != nullptr && max_splitK > 1 && kv_blocks > 1) {
+        int total_base = num_kv_heads * num_seqs;
+        // Target enough blocks to fill MI300X CUs (304)
+        constexpr int TARGET_BLOCKS = 304;
+        splitK = (TARGET_BLOCKS + total_base - 1) / total_base;
+        splitK = min(splitK, kv_blocks);     // can't split more than available blocks
+        splitK = min(splitK, max_splitK);    // cap at caller's limit
+        if (splitK < 2) splitK = 1;
     }
 
     if (splitK <= 1) {

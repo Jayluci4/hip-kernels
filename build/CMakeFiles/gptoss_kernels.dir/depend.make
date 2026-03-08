@@ -7,6 +7,12 @@ CMakeFiles/gptoss_kernels.dir/src/kernels/flash_attention.cu.o: \
  /root/diagnose-kernels-gpt/hip-kernels/include/hip_compat.h \
  /root/diagnose-kernels-gpt/hip-kernels/include/tensor.h \
  /root/diagnose-kernels-gpt/hip-kernels/src/kernels/flash_attention.cu
+CMakeFiles/gptoss_kernels.dir/src/kernels/fused_mxfp4_gemv.cu.o: \
+ /root/diagnose-kernels-gpt/hip-kernels/include/hip_compat.h \
+ /root/diagnose-kernels-gpt/hip-kernels/src/kernels/fused_mxfp4_gemv.cu
+CMakeFiles/gptoss_kernels.dir/src/kernels/gemv_bf16.cu.o: \
+ /root/diagnose-kernels-gpt/hip-kernels/include/hip_compat.h \
+ /root/diagnose-kernels-gpt/hip-kernels/src/kernels/gemv_bf16.cu
 CMakeFiles/gptoss_kernels.dir/src/kernels/moe_combine.cu.o: \
  /root/diagnose-kernels-gpt/hip-kernels/include/config.h \
  /root/diagnose-kernels-gpt/hip-kernels/include/cuda_utils.h \

@@ -1,5 +1,7 @@
 file(REMOVE_RECURSE
   "CMakeFiles/gptoss_kernels.dir/src/kernels/flash_attention.cu.o"
+  "CMakeFiles/gptoss_kernels.dir/src/kernels/fused_mxfp4_gemv.cu.o"
+  "CMakeFiles/gptoss_kernels.dir/src/kernels/gemv_bf16.cu.o"
   "CMakeFiles/gptoss_kernels.dir/src/kernels/moe_combine.cu.o"
   "CMakeFiles/gptoss_kernels.dir/src/kernels/moe_permute.cu.o"
   "CMakeFiles/gptoss_kernels.dir/src/kernels/mxfp4_dequant.cu.o"

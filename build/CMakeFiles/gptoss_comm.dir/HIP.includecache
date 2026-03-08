@@ -25,6 +25,10 @@ hipblas/hipblas.h
 -
 hipblaslt/hipblaslt.h
 -
+hipblaslt/hipblaslt-ext.hpp
+-
+vector
+-
 
 /root/diagnose-kernels-gpt/hip-kernels/include/hip_compat.h
 hip/hip_runtime.h

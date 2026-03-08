@@ -69,9 +69,35 @@ include CMakeFiles/gptoss_kernels.dir/progress.make
 # Include the compile flags for this target's objects.
 include CMakeFiles/gptoss_kernels.dir/flags.make
 
+CMakeFiles/gptoss_kernels.dir/src/kernels/gemv_bf16.cu.o: CMakeFiles/gptoss_kernels.dir/flags.make
+CMakeFiles/gptoss_kernels.dir/src/kernels/gemv_bf16.cu.o: /root/diagnose-kernels-gpt/hip-kernels/src/kernels/gemv_bf16.cu
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building HIP object CMakeFiles/gptoss_kernels.dir/src/kernels/gemv_bf16.cu.o"
+	/opt/rocm-7.1.0/lib/llvm/bin/clang++  $(HIP_DEFINES) $(HIP_INCLUDES) $(HIP_FLAGS) -o CMakeFiles/gptoss_kernels.dir/src/kernels/gemv_bf16.cu.o -x hip -c /root/diagnose-kernels-gpt/hip-kernels/src/kernels/gemv_bf16.cu
+
+CMakeFiles/gptoss_kernels.dir/src/kernels/gemv_bf16.cu.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing HIP source to CMakeFiles/gptoss_kernels.dir/src/kernels/gemv_bf16.cu.i"
+	/opt/rocm-7.1.0/lib/llvm/bin/clang++ $(HIP_DEFINES) $(HIP_INCLUDES) $(HIP_FLAGS) -E /root/diagnose-kernels-gpt/hip-kernels/src/kernels/gemv_bf16.cu > CMakeFiles/gptoss_kernels.dir/src/kernels/gemv_bf16.cu.i
+
+CMakeFiles/gptoss_kernels.dir/src/kernels/gemv_bf16.cu.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling HIP source to assembly CMakeFiles/gptoss_kernels.dir/src/kernels/gemv_bf16.cu.s"
+	/opt/rocm-7.1.0/lib/llvm/bin/clang++ $(HIP_DEFINES) $(HIP_INCLUDES) $(HIP_FLAGS) -S /root/diagnose-kernels-gpt/hip-kernels/src/kernels/gemv_bf16.cu -o CMakeFiles/gptoss_kernels.dir/src/kernels/gemv_bf16.cu.s
+
+CMakeFiles/gptoss_kernels.dir/src/kernels/fused_mxfp4_gemv.cu.o: CMakeFiles/gptoss_kernels.dir/flags.make
+CMakeFiles/gptoss_kernels.dir/src/kernels/fused_mxfp4_gemv.cu.o: /root/diagnose-kernels-gpt/hip-kernels/src/kernels/fused_mxfp4_gemv.cu
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building HIP object CMakeFiles/gptoss_kernels.dir/src/kernels/fused_mxfp4_gemv.cu.o"
+	/opt/rocm-7.1.0/lib/llvm/bin/clang++  $(HIP_DEFINES) $(HIP_INCLUDES) $(HIP_FLAGS) -o CMakeFiles/gptoss_kernels.dir/src/kernels/fused_mxfp4_gemv.cu.o -x hip -c /root/diagnose-kernels-gpt/hip-kernels/src/kernels/fused_mxfp4_gemv.cu
+
+CMakeFiles/gptoss_kernels.dir/src/kernels/fused_mxfp4_gemv.cu.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing HIP source to CMakeFiles/gptoss_kernels.dir/src/kernels/fused_mxfp4_gemv.cu.i"
+	/opt/rocm-7.1.0/lib/llvm/bin/clang++ $(HIP_DEFINES) $(HIP_INCLUDES) $(HIP_FLAGS) -E /root/diagnose-kernels-gpt/hip-kernels/src/kernels/fused_mxfp4_gemv.cu > CMakeFiles/gptoss_kernels.dir/src/kernels/fused_mxfp4_gemv.cu.i
+
+CMakeFiles/gptoss_kernels.dir/src/kernels/fused_mxfp4_gemv.cu.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling HIP source to assembly CMakeFiles/gptoss_kernels.dir/src/kernels/fused_mxfp4_gemv.cu.s"
+	/opt/rocm-7.1.0/lib/llvm/bin/clang++ $(HIP_DEFINES) $(HIP_INCLUDES) $(HIP_FLAGS) -S /root/diagnose-kernels-gpt/hip-kernels/src/kernels/fused_mxfp4_gemv.cu -o CMakeFiles/gptoss_kernels.dir/src/kernels/fused_mxfp4_gemv.cu.s
+
 CMakeFiles/gptoss_kernels.dir/src/kernels/mxfp4_dequant.cu.o: CMakeFiles/gptoss_kernels.dir/flags.make
 CMakeFiles/gptoss_kernels.dir/src/kernels/mxfp4_dequant.cu.o: /root/diagnose-kernels-gpt/hip-kernels/src/kernels/mxfp4_dequant.cu
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building HIP object CMakeFiles/gptoss_kernels.dir/src/kernels/mxfp4_dequant.cu.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building HIP object CMakeFiles/gptoss_kernels.dir/src/kernels/mxfp4_dequant.cu.o"
 	/opt/rocm-7.1.0/lib/llvm/bin/clang++  $(HIP_DEFINES) $(HIP_INCLUDES) $(HIP_FLAGS) -o CMakeFiles/gptoss_kernels.dir/src/kernels/mxfp4_dequant.cu.o -x hip -c /root/diagnose-kernels-gpt/hip-kernels/src/kernels/mxfp4_dequant.cu
 
 CMakeFiles/gptoss_kernels.dir/src/kernels/mxfp4_dequant.cu.i: cmake_force
@@ -84,7 +110,7 @@ CMakeFiles/gptoss_kernels.dir/src/kernels/mxfp4_dequant.cu.s: cmake_force
 
 CMakeFiles/gptoss_kernels.dir/src/kernels/rmsnorm.cu.o: CMakeFiles/gptoss_kernels.dir/flags.make
 CMakeFiles/gptoss_kernels.dir/src/kernels/rmsnorm.cu.o: /root/diagnose-kernels-gpt/hip-kernels/src/kernels/rmsnorm.cu
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building HIP object CMakeFiles/gptoss_kernels.dir/src/kernels/rmsnorm.cu.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Building HIP object CMakeFiles/gptoss_kernels.dir/src/kernels/rmsnorm.cu.o"
 	/opt/rocm-7.1.0/lib/llvm/bin/clang++  $(HIP_DEFINES) $(HIP_INCLUDES) $(HIP_FLAGS) -o CMakeFiles/gptoss_kernels.dir/src/kernels/rmsnorm.cu.o -x hip -c /root/diagnose-kernels-gpt/hip-kernels/src/kernels/rmsnorm.cu
 
 CMakeFiles/gptoss_kernels.dir/src/kernels/rmsnorm.cu.i: cmake_force
@@ -97,7 +123,7 @@ CMakeFiles/gptoss_kernels.dir/src/kernels/rmsnorm.cu.s: cmake_force
 
 CMakeFiles/gptoss_kernels.dir/src/kernels/rope.cu.o: CMakeFiles/gptoss_kernels.dir/flags.make
 CMakeFiles/gptoss_kernels.dir/src/kernels/rope.cu.o: /root/diagnose-kernels-gpt/hip-kernels/src/kernels/rope.cu
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building HIP object CMakeFiles/gptoss_kernels.dir/src/kernels/rope.cu.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Building HIP object CMakeFiles/gptoss_kernels.dir/src/kernels/rope.cu.o"
 	/opt/rocm-7.1.0/lib/llvm/bin/clang++  $(HIP_DEFINES) $(HIP_INCLUDES) $(HIP_FLAGS) -o CMakeFiles/gptoss_kernels.dir/src/kernels/rope.cu.o -x hip -c /root/diagnose-kernels-gpt/hip-kernels/src/kernels/rope.cu
 
 CMakeFiles/gptoss_kernels.dir/src/kernels/rope.cu.i: cmake_force
@@ -110,7 +136,7 @@ CMakeFiles/gptoss_kernels.dir/src/kernels/rope.cu.s: cmake_force
 
 CMakeFiles/gptoss_kernels.dir/src/kernels/swiglu.cu.o: CMakeFiles/gptoss_kernels.dir/flags.make
 CMakeFiles/gptoss_kernels.dir/src/kernels/swiglu.cu.o: /root/diagnose-kernels-gpt/hip-kernels/src/kernels/swiglu.cu
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Building HIP object CMakeFiles/gptoss_kernels.dir/src/kernels/swiglu.cu.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_6) "Building HIP object CMakeFiles/gptoss_kernels.dir/src/kernels/swiglu.cu.o"
 	/opt/rocm-7.1.0/lib/llvm/bin/clang++  $(HIP_DEFINES) $(HIP_INCLUDES) $(HIP_FLAGS) -o CMakeFiles/gptoss_kernels.dir/src/kernels/swiglu.cu.o -x hip -c /root/diagnose-kernels-gpt/hip-kernels/src/kernels/swiglu.cu
 
 CMakeFiles/gptoss_kernels.dir/src/kernels/swiglu.cu.i: cmake_force
@@ -123,7 +149,7 @@ CMakeFiles/gptoss_kernels.dir/src/kernels/swiglu.cu.s: cmake_force
 
 CMakeFiles/gptoss_kernels.dir/src/kernels/flash_attention.cu.o: CMakeFiles/gptoss_kernels.dir/flags.make
 CMakeFiles/gptoss_kernels.dir/src/kernels/flash_attention.cu.o: /root/diagnose-kernels-gpt/hip-kernels/src/kernels/flash_attention.cu
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Building HIP object CMakeFiles/gptoss_kernels.dir/src/kernels/flash_attention.cu.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_7) "Building HIP object CMakeFiles/gptoss_kernels.dir/src/kernels/flash_attention.cu.o"
 	/opt/rocm-7.1.0/lib/llvm/bin/clang++  $(HIP_DEFINES) $(HIP_INCLUDES) $(HIP_FLAGS) -o CMakeFiles/gptoss_kernels.dir/src/kernels/flash_attention.cu.o -x hip -c /root/diagnose-kernels-gpt/hip-kernels/src/kernels/flash_attention.cu
 
 CMakeFiles/gptoss_kernels.dir/src/kernels/flash_attention.cu.i: cmake_force
@@ -136,7 +162,7 @@ CMakeFiles/gptoss_kernels.dir/src/kernels/flash_attention.cu.s: cmake_force
 
 CMakeFiles/gptoss_kernels.dir/src/kernels/paged_attention.cu.o: CMakeFiles/gptoss_kernels.dir/flags.make
 CMakeFiles/gptoss_kernels.dir/src/kernels/paged_attention.cu.o: /root/diagnose-kernels-gpt/hip-kernels/src/kernels/paged_attention.cu
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_6) "Building HIP object CMakeFiles/gptoss_kernels.dir/src/kernels/paged_attention.cu.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_8) "Building HIP object CMakeFiles/gptoss_kernels.dir/src/kernels/paged_attention.cu.o"
 	/opt/rocm-7.1.0/lib/llvm/bin/clang++  $(HIP_DEFINES) $(HIP_INCLUDES) $(HIP_FLAGS) -o CMakeFiles/gptoss_kernels.dir/src/kernels/paged_attention.cu.o -x hip -c /root/diagnose-kernels-gpt/hip-kernels/src/kernels/paged_attention.cu
 
 CMakeFiles/gptoss_kernels.dir/src/kernels/paged_attention.cu.i: cmake_force
@@ -149,7 +175,7 @@ CMakeFiles/gptoss_kernels.dir/src/kernels/paged_attention.cu.s: cmake_force
 
 CMakeFiles/gptoss_kernels.dir/src/kernels/topk_softmax.cu.o: CMakeFiles/gptoss_kernels.dir/flags.make
 CMakeFiles/gptoss_kernels.dir/src/kernels/topk_softmax.cu.o: /root/diagnose-kernels-gpt/hip-kernels/src/kernels/topk_softmax.cu
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_7) "Building HIP object CMakeFiles/gptoss_kernels.dir/src/kernels/topk_softmax.cu.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_9) "Building HIP object CMakeFiles/gptoss_kernels.dir/src/kernels/topk_softmax.cu.o"
 	/opt/rocm-7.1.0/lib/llvm/bin/clang++  $(HIP_DEFINES) $(HIP_INCLUDES) $(HIP_FLAGS) -o CMakeFiles/gptoss_kernels.dir/src/kernels/topk_softmax.cu.o -x hip -c /root/diagnose-kernels-gpt/hip-kernels/src/kernels/topk_softmax.cu
 
 CMakeFiles/gptoss_kernels.dir/src/kernels/topk_softmax.cu.i: cmake_force
@@ -162,7 +188,7 @@ CMakeFiles/gptoss_kernels.dir/src/kernels/topk_softmax.cu.s: cmake_force
 
 CMakeFiles/gptoss_kernels.dir/src/kernels/moe_permute.cu.o: CMakeFiles/gptoss_kernels.dir/flags.make
 CMakeFiles/gptoss_kernels.dir/src/kernels/moe_permute.cu.o: /root/diagnose-kernels-gpt/hip-kernels/src/kernels/moe_permute.cu
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_8) "Building HIP object CMakeFiles/gptoss_kernels.dir/src/kernels/moe_permute.cu.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_10) "Building HIP object CMakeFiles/gptoss_kernels.dir/src/kernels/moe_permute.cu.o"
 	/opt/rocm-7.1.0/lib/llvm/bin/clang++  $(HIP_DEFINES) $(HIP_INCLUDES) $(HIP_FLAGS) -o CMakeFiles/gptoss_kernels.dir/src/kernels/moe_permute.cu.o -x hip -c /root/diagnose-kernels-gpt/hip-kernels/src/kernels/moe_permute.cu
 
 CMakeFiles/gptoss_kernels.dir/src/kernels/moe_permute.cu.i: cmake_force
@@ -175,7 +201,7 @@ CMakeFiles/gptoss_kernels.dir/src/kernels/moe_permute.cu.s: cmake_force
 
 CMakeFiles/gptoss_kernels.dir/src/kernels/moe_combine.cu.o: CMakeFiles/gptoss_kernels.dir/flags.make
 CMakeFiles/gptoss_kernels.dir/src/kernels/moe_combine.cu.o: /root/diagnose-kernels-gpt/hip-kernels/src/kernels/moe_combine.cu
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_9) "Building HIP object CMakeFiles/gptoss_kernels.dir/src/kernels/moe_combine.cu.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_11) "Building HIP object CMakeFiles/gptoss_kernels.dir/src/kernels/moe_combine.cu.o"
 	/opt/rocm-7.1.0/lib/llvm/bin/clang++  $(HIP_DEFINES) $(HIP_INCLUDES) $(HIP_FLAGS) -o CMakeFiles/gptoss_kernels.dir/src/kernels/moe_combine.cu.o -x hip -c /root/diagnose-kernels-gpt/hip-kernels/src/kernels/moe_combine.cu
 
 CMakeFiles/gptoss_kernels.dir/src/kernels/moe_combine.cu.i: cmake_force
@@ -188,6 +214,8 @@ CMakeFiles/gptoss_kernels.dir/src/kernels/moe_combine.cu.s: cmake_force
 
 # Object files for target gptoss_kernels
 gptoss_kernels_OBJECTS = \
+"CMakeFiles/gptoss_kernels.dir/src/kernels/gemv_bf16.cu.o" \
+"CMakeFiles/gptoss_kernels.dir/src/kernels/fused_mxfp4_gemv.cu.o" \
 "CMakeFiles/gptoss_kernels.dir/src/kernels/mxfp4_dequant.cu.o" \
 "CMakeFiles/gptoss_kernels.dir/src/kernels/rmsnorm.cu.o" \
 "CMakeFiles/gptoss_kernels.dir/src/kernels/rope.cu.o" \
@@ -201,6 +229,8 @@ gptoss_kernels_OBJECTS = \
 # External object files for target gptoss_kernels
 gptoss_kernels_EXTERNAL_OBJECTS =
 
+libgptoss_kernels.a: CMakeFiles/gptoss_kernels.dir/src/kernels/gemv_bf16.cu.o
+libgptoss_kernels.a: CMakeFiles/gptoss_kernels.dir/src/kernels/fused_mxfp4_gemv.cu.o
 libgptoss_kernels.a: CMakeFiles/gptoss_kernels.dir/src/kernels/mxfp4_dequant.cu.o
 libgptoss_kernels.a: CMakeFiles/gptoss_kernels.dir/src/kernels/rmsnorm.cu.o
 libgptoss_kernels.a: CMakeFiles/gptoss_kernels.dir/src/kernels/rope.cu.o
@@ -212,7 +242,7 @@ libgptoss_kernels.a: CMakeFiles/gptoss_kernels.dir/src/kernels/moe_permute.cu.o
 libgptoss_kernels.a: CMakeFiles/gptoss_kernels.dir/src/kernels/moe_combine.cu.o
 libgptoss_kernels.a: CMakeFiles/gptoss_kernels.dir/build.make
 libgptoss_kernels.a: CMakeFiles/gptoss_kernels.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_10) "Linking HIP static library libgptoss_kernels.a"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_12) "Linking HIP static library libgptoss_kernels.a"
 	$(CMAKE_COMMAND) -P CMakeFiles/gptoss_kernels.dir/cmake_clean_target.cmake
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/gptoss_kernels.dir/link.txt --verbose=$(VERBOSE)
 

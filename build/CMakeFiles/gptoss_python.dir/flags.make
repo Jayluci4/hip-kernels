@@ -6,5 +6,5 @@ HIP_DEFINES = -DHIPBLASLT_USE_ROCROLLER -DUSE_PROF_API=1 -D__HIP_PLATFORM_AMD__=
 
 HIP_INCLUDES = -I/root/diagnose-kernels-gpt/hip-kernels/include -isystem /usr/include/python3.12 -isystem /usr/local/lib/python3.12/dist-packages/pybind11/include
 
-HIP_FLAGS =  --offload-arch=gfx942 -fPIC
+HIP_FLAGS = -O3 -DNDEBUG --offload-arch=gfx942 -fPIC
 

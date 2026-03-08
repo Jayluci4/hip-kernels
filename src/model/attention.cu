@@ -25,6 +25,15 @@
 
 namespace gptoss {
 
+// Custom BF16 GEMV for M=1 decode -- replaces hipBLASLt overhead
+extern void gemv_bf16_forward(
+    const __hip_bfloat16* input,
+    const __hip_bfloat16* weight,
+    __hip_bfloat16* output,
+    int N, int K,
+    hipStream_t stream,
+    const __hip_bfloat16* bias = nullptr);
+
 // ---------------------------------------------------------------------------
 // Extern kernel declarations (defined in src/kernels/*.cu)
 // ---------------------------------------------------------------------------
@@ -266,6 +275,78 @@ static void kv_cache_update(
 }
 
 // ---------------------------------------------------------------------------
+// Fused split_qkv + rope_K + kv_cache_update for decode (B=1).
+// Eliminates 2 kernel launches per layer (split_qkv + rope_k merged with kv_update).
+// Reads QKV buffer once, writes Q to q_out, applies RoPE to K, writes K+V to cache.
+// ---------------------------------------------------------------------------
+__global__ void fused_split_rope_kv_kernel(
+    const __hip_bfloat16* __restrict__ qkv,      // [num_tokens, qkv_size]
+    __hip_bfloat16* __restrict__ q_out,            // [num_tokens, q_dim]
+    __hip_bfloat16* __restrict__ k_cache,          // [max_blocks, kv_heads, block_size, head_dim]
+    __hip_bfloat16* __restrict__ v_cache,          // [max_blocks, kv_heads, block_size, head_dim]
+    const float2* __restrict__ cos_sin_table,      // [max_pos, half_dim]
+    const int* __restrict__ positions,             // [num_tokens]
+    const int32_t* __restrict__ slot_mapping,      // [num_tokens]
+    int num_tokens)
+{
+    constexpr int qkv_size = ModelConfig::tp_qkv_size;
+    constexpr int q_dim    = ModelConfig::tp_q_dim;
+    constexpr int kv_dim   = ModelConfig::tp_kv_dim;
+    constexpr int num_kv_heads = ModelConfig::tp_kv_heads;
+    constexpr int head_dim = ModelConfig::head_dim;
+    constexpr int half_dim = head_dim / 2;
+    constexpr int block_size = ModelConfig::kv_block_size;
+
+    int token = blockIdx.x;
+    if (token >= num_tokens) return;
+
+    const __hip_bfloat16* src = qkv + static_cast<int64_t>(token) * qkv_size;
+    __hip_bfloat16* q_dst = q_out + static_cast<int64_t>(token) * q_dim;
+
+    // Step 1: Copy Q portion
+    for (int i = threadIdx.x; i < q_dim; i += blockDim.x) {
+        q_dst[i] = src[i];
+    }
+
+    // Step 2: Read K from QKV, apply RoPE, write to KV cache
+    int pos = positions[token];
+    int slot = slot_mapping[token];
+    int block_idx = slot / block_size;
+    int offset_in_block = slot % block_size;
+
+    for (int i = threadIdx.x; i < kv_dim; i += blockDim.x) {
+        int head = i / head_dim;
+        int d = i % head_dim;
+
+        // Read K from QKV buffer
+        float k_val = __bfloat162float(src[q_dim + i]);
+
+        // Apply RoPE rotation (half-split convention)
+        float rotated;
+        if (d < half_dim) {
+            float k_pair = __bfloat162float(src[q_dim + head * head_dim + half_dim + d]);
+            float2 cs = cos_sin_table[pos * half_dim + d];
+            rotated = k_val * cs.x - k_pair * cs.y;
+        } else {
+            int d_lo = d - half_dim;
+            float k_pair = __bfloat162float(src[q_dim + head * head_dim + d_lo]);
+            float2 cs = cos_sin_table[pos * half_dim + d_lo];
+            rotated = k_pair * cs.y + k_val * cs.x;
+        }
+
+        // Write rotated K to cache
+        int64_t cache_offset =
+            static_cast<int64_t>(block_idx) * (num_kv_heads * block_size * head_dim) +
+            static_cast<int64_t>(head) * (block_size * head_dim) +
+            static_cast<int64_t>(offset_in_block) * head_dim + d;
+        k_cache[cache_offset] = __float2bfloat16(rotated);
+
+        // Read V from QKV buffer and write to cache
+        v_cache[cache_offset] = src[q_dim + kv_dim + i];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Split fused QKV tensor into separate Q, K, V buffers (free function)
 //
 // TP2 QKV layout per token: [Q(tp_q_dim) | K(tp_kv_dim) | V(tp_kv_dim)]
@@ -356,7 +437,7 @@ public:
     float* partial_out_ = nullptr;      // [max_batch, kv_heads, max_splitK, gqa_ratio, head_dim]
     float* partial_max_ = nullptr;      // [max_batch, kv_heads, max_splitK, gqa_ratio]
     float* partial_sum_ = nullptr;      // [max_batch, kv_heads, max_splitK, gqa_ratio]
-    static constexpr int pa_max_splitK_ = 8;
+    static constexpr int pa_max_splitK_ = 64;
 
     // ---- hipBLAS handle (not owned) ----
     const CublasHandle* cublas_;
@@ -500,9 +581,12 @@ public:
         }
 
         // Allocate splitK partial buffers for flash decoding
+        // batch_size and splitK trade off: large batches use splitK=1, B=1 uses high splitK.
+        // Max concurrent = max(max_batch_size, pa_max_splitK_) to avoid overallocation.
         {
-            int partial_entries = ModelConfig::max_batch_size * num_kv_heads
-                                  * pa_max_splitK_ * ModelConfig::gqa_ratio;
+            int max_concurrent = (ModelConfig::max_batch_size > pa_max_splitK_)
+                                 ? ModelConfig::max_batch_size : pa_max_splitK_;
+            int partial_entries = max_concurrent * num_kv_heads * ModelConfig::gqa_ratio;
             CUDA_CHECK(hipMalloc(&partial_out_,
                 partial_entries * head_dim * sizeof(float)));
             CUDA_CHECK(hipMalloc(&partial_max_,
@@ -818,17 +902,30 @@ private:
     {
         rmsnorm_forward(input, attn_norm_weight_, norm_buf_,
                         num_seqs, hidden_size, rms_norm_eps, stream);
-        cublas_->gemm_bf16_lt(norm_buf_, qkv_weight_, qkv_buf_,
-                              num_seqs, qkv_size, hidden_size, stream,
-                              /*alpha=*/1.0f, /*beta=*/0.0f, /*bias=*/qkv_bias_,
-                              /*transB=*/true);
-        split_qkv(qkv_buf_, q_buf_, k_buf_, v_buf_, num_seqs, stream);
-        rope_forward(nullptr, k_buf_, nullptr, k_rope_buf_,
-                     cos_table_, sin_table_, cos_sin_table_, positions,
-                     num_seqs, num_q_heads, num_kv_heads, head_dim, stream);
-        kv_cache_update(k_cache_, v_cache_, k_rope_buf_, v_buf_,
-                        slot_mapping, num_seqs, num_kv_heads, head_dim,
-                        kv_block_size, stream);
+        if (num_seqs == 1) {
+            // Decode B=1: custom GEMV — eliminates ~1.5ms hipBLASLt overhead per call
+            gemv_bf16_forward(norm_buf_, qkv_weight_, qkv_buf_,
+                              qkv_size, hidden_size, stream, qkv_bias_);
+        } else {
+            cublas_->gemm_bf16_lt(norm_buf_, qkv_weight_, qkv_buf_,
+                                  num_seqs, qkv_size, hidden_size, stream,
+                                  /*alpha=*/1.0f, /*beta=*/0.0f, /*bias=*/qkv_bias_,
+                                  /*transB=*/true);
+        }
+        if (num_seqs == 1) {
+            // Fused split_qkv + RoPE_K + KV cache update — 1 kernel instead of 3
+            fused_split_rope_kv_kernel<<<1, 256, 0, stream>>>(
+                qkv_buf_, q_buf_, k_cache_, v_cache_,
+                cos_sin_table_, positions, slot_mapping, 1);
+        } else {
+            split_qkv(qkv_buf_, q_buf_, k_buf_, v_buf_, num_seqs, stream);
+            rope_forward(nullptr, k_buf_, nullptr, k_rope_buf_,
+                         cos_table_, sin_table_, cos_sin_table_, positions,
+                         num_seqs, num_q_heads, num_kv_heads, head_dim, stream);
+            kv_cache_update(k_cache_, v_cache_, k_rope_buf_, v_buf_,
+                            slot_mapping, num_seqs, num_kv_heads, head_dim,
+                            kv_block_size, stream);
+        }
         paged_attention_forward(q_buf_, k_cache_, v_cache_, attn_out_buf_,
                                 block_table, seq_lens, sink_values_,
                                 cos_sin_table_, num_seqs, num_q_heads,
@@ -836,11 +933,17 @@ private:
                                 max_num_blocks, window_size_,
                                 partial_out_, partial_max_, partial_sum_,
                                 pa_max_splitK_, stream);
-        cublas_->gemm_bf16_lt(attn_out_buf_, o_proj_weight_, proj_out_buf_,
-                              num_seqs, hidden_size, attn_out_size, stream,
-                              /*alpha=*/1.0f, /*beta=*/0.0f,
-                              /*bias=*/(ModelConfig::tp_size == 1) ? o_proj_bias_ : nullptr,
-                              /*transB=*/true);
+        if (num_seqs == 1) {
+            const __hip_bfloat16* o_bias = (ModelConfig::tp_size == 1) ? o_proj_bias_ : nullptr;
+            gemv_bf16_forward(attn_out_buf_, o_proj_weight_, proj_out_buf_,
+                              hidden_size, attn_out_size, stream, o_bias);
+        } else {
+            cublas_->gemm_bf16_lt(attn_out_buf_, o_proj_weight_, proj_out_buf_,
+                                  num_seqs, hidden_size, attn_out_size, stream,
+                                  /*alpha=*/1.0f, /*beta=*/0.0f,
+                                  /*bias=*/(ModelConfig::tp_size == 1) ? o_proj_bias_ : nullptr,
+                                  /*transB=*/true);
+        }
     }
 
     // Steps 8-10: event sync + RCCL AllReduce on comm_stream_ + event sync back

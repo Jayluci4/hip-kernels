@@ -33,6 +33,8 @@ find_package(pybind11 CONFIG REQUIRED)
 
 # Kernel library
 add_library(gptoss_kernels STATIC
+    src/kernels/gemv_bf16.cu
+    src/kernels/fused_mxfp4_gemv.cu
     src/kernels/mxfp4_dequant.cu
     src/kernels/rmsnorm.cu
     src/kernels/rope.cu
@@ -44,6 +46,8 @@ add_library(gptoss_kernels STATIC
     src/kernels/moe_combine.cu
 )
 set_source_files_properties(
+    src/kernels/gemv_bf16.cu
+    src/kernels/fused_mxfp4_gemv.cu
     src/kernels/mxfp4_dequant.cu
     src/kernels/rmsnorm.cu
     src/kernels/rope.cu

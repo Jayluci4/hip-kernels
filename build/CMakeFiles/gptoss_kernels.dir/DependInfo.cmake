@@ -9,6 +9,8 @@ set(CMAKE_DEPENDS_LANGUAGES
 # The set of files for implicit dependencies of each language:
 set(CMAKE_DEPENDS_CHECK_HIP
   "/root/diagnose-kernels-gpt/hip-kernels/src/kernels/flash_attention.cu" "/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles/gptoss_kernels.dir/src/kernels/flash_attention.cu.o"
+  "/root/diagnose-kernels-gpt/hip-kernels/src/kernels/fused_mxfp4_gemv.cu" "/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles/gptoss_kernels.dir/src/kernels/fused_mxfp4_gemv.cu.o"
+  "/root/diagnose-kernels-gpt/hip-kernels/src/kernels/gemv_bf16.cu" "/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles/gptoss_kernels.dir/src/kernels/gemv_bf16.cu.o"
   "/root/diagnose-kernels-gpt/hip-kernels/src/kernels/moe_combine.cu" "/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles/gptoss_kernels.dir/src/kernels/moe_combine.cu.o"
   "/root/diagnose-kernels-gpt/hip-kernels/src/kernels/moe_permute.cu" "/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles/gptoss_kernels.dir/src/kernels/moe_permute.cu.o"
   "/root/diagnose-kernels-gpt/hip-kernels/src/kernels/mxfp4_dequant.cu" "/root/diagnose-kernels-gpt/hip-kernels/build/CMakeFiles/gptoss_kernels.dir/src/kernels/mxfp4_dequant.cu.o"

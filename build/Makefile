@@ -349,6 +349,54 @@ src/kernels/flash_attention.cu.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/gptoss_kernels.dir/build.make CMakeFiles/gptoss_kernels.dir/src/kernels/flash_attention.cu.s
 .PHONY : src/kernels/flash_attention.cu.s
 
+src/kernels/fused_mxfp4_gemv.o: src/kernels/fused_mxfp4_gemv.cu.o
+.PHONY : src/kernels/fused_mxfp4_gemv.o
+
+# target to build an object file
+src/kernels/fused_mxfp4_gemv.cu.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/gptoss_kernels.dir/build.make CMakeFiles/gptoss_kernels.dir/src/kernels/fused_mxfp4_gemv.cu.o
+.PHONY : src/kernels/fused_mxfp4_gemv.cu.o
+
+src/kernels/fused_mxfp4_gemv.i: src/kernels/fused_mxfp4_gemv.cu.i
+.PHONY : src/kernels/fused_mxfp4_gemv.i
+
+# target to preprocess a source file
+src/kernels/fused_mxfp4_gemv.cu.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/gptoss_kernels.dir/build.make CMakeFiles/gptoss_kernels.dir/src/kernels/fused_mxfp4_gemv.cu.i
+.PHONY : src/kernels/fused_mxfp4_gemv.cu.i
+
+src/kernels/fused_mxfp4_gemv.s: src/kernels/fused_mxfp4_gemv.cu.s
+.PHONY : src/kernels/fused_mxfp4_gemv.s
+
+# target to generate assembly for a file
+src/kernels/fused_mxfp4_gemv.cu.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/gptoss_kernels.dir/build.make CMakeFiles/gptoss_kernels.dir/src/kernels/fused_mxfp4_gemv.cu.s
+.PHONY : src/kernels/fused_mxfp4_gemv.cu.s
+
+src/kernels/gemv_bf16.o: src/kernels/gemv_bf16.cu.o
+.PHONY : src/kernels/gemv_bf16.o
+
+# target to build an object file
+src/kernels/gemv_bf16.cu.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/gptoss_kernels.dir/build.make CMakeFiles/gptoss_kernels.dir/src/kernels/gemv_bf16.cu.o
+.PHONY : src/kernels/gemv_bf16.cu.o
+
+src/kernels/gemv_bf16.i: src/kernels/gemv_bf16.cu.i
+.PHONY : src/kernels/gemv_bf16.i
+
+# target to preprocess a source file
+src/kernels/gemv_bf16.cu.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/gptoss_kernels.dir/build.make CMakeFiles/gptoss_kernels.dir/src/kernels/gemv_bf16.cu.i
+.PHONY : src/kernels/gemv_bf16.cu.i
+
+src/kernels/gemv_bf16.s: src/kernels/gemv_bf16.cu.s
+.PHONY : src/kernels/gemv_bf16.s
+
+# target to generate assembly for a file
+src/kernels/gemv_bf16.cu.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/gptoss_kernels.dir/build.make CMakeFiles/gptoss_kernels.dir/src/kernels/gemv_bf16.cu.s
+.PHONY : src/kernels/gemv_bf16.cu.s
+
 src/kernels/moe_combine.o: src/kernels/moe_combine.cu.o
 .PHONY : src/kernels/moe_combine.o
 
@@ -719,6 +767,12 @@ help:
 	@echo "... src/kernels/flash_attention.o"
 	@echo "... src/kernels/flash_attention.i"
 	@echo "... src/kernels/flash_attention.s"
+	@echo "... src/kernels/fused_mxfp4_gemv.o"
+	@echo "... src/kernels/fused_mxfp4_gemv.i"
+	@echo "... src/kernels/fused_mxfp4_gemv.s"
+	@echo "... src/kernels/gemv_bf16.o"
+	@echo "... src/kernels/gemv_bf16.i"
+	@echo "... src/kernels/gemv_bf16.s"
 	@echo "... src/kernels/moe_combine.o"
 	@echo "... src/kernels/moe_combine.i"
 	@echo "... src/kernels/moe_combine.s"

@@ -25,6 +25,10 @@ hipblas/hipblas.h
 -
 hipblaslt/hipblaslt.h
 -
+hipblaslt/hipblaslt-ext.hpp
+-
+vector
+-
 
 /root/diagnose-kernels-gpt/hip-kernels/include/hip_compat.h
 hip/hip_runtime.h
@@ -42,6 +46,10 @@ rccl/rccl.h
 hip/hip_runtime.h
 -
 
+/root/diagnose-kernels-gpt/hip-kernels/include/profiler.h
+hip/hip_runtime.h
+-
+
 /root/diagnose-kernels-gpt/hip-kernels/include/tensor.h
 cstdint
 -
@@ -51,6 +59,18 @@ cassert
 -
 hip_compat.h
 /root/diagnose-kernels-gpt/hip-kernels/include/hip_compat.h
+
+/root/diagnose-kernels-gpt/hip-kernels/src/engine/bridge.cu
+hip/hip_runtime.h
+-
+cstdint
+-
+cstring
+-
+vector
+-
+string
+-
 
 /root/diagnose-kernels-gpt/hip-kernels/src/engine/engine.cu
 hip_compat.h
@@ -93,6 +113,30 @@ cuda_utils.h
 /root/diagnose-kernels-gpt/hip-kernels/src/engine/cuda_utils.h
 nccl_utils.h
 /root/diagnose-kernels-gpt/hip-kernels/src/engine/nccl_utils.h
+
+/root/diagnose-kernels-gpt/hip-kernels/src/engine/profiler.cu
+hip_compat.h
+/root/diagnose-kernels-gpt/hip-kernels/src/engine/hip_compat.h
+cstdio
+-
+cstdint
+-
+cstring
+-
+vector
+-
+unordered_map
+-
+string
+-
+mutex
+-
+algorithm
+-
+profiler.h
+/root/diagnose-kernels-gpt/hip-kernels/src/engine/profiler.h
+cuda_utils.h
+/root/diagnose-kernels-gpt/hip-kernels/src/engine/cuda_utils.h
 
 /root/diagnose-kernels-gpt/hip-kernels/src/memory/kv_cache_manager.cu
 hip_compat.h
