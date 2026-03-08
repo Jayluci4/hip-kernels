@@ -21,6 +21,7 @@
 #include <cmath>
 #include <vector>
 #include <chrono>
+#include <unordered_map>
 #include <rccl/rccl.h>
 
 #include "config.h"
@@ -269,6 +270,21 @@ public:
     bool initialized_;
     bool skip_moe_ = false;  // Set via env GPTOSS_SKIP_MOE=1 for models with zero-delta MoE
 
+    // ---- HIP Graph cache for B=1 decode ----
+    // Caches captured graphs keyed by max_num_blocks. max_num_blocks changes every
+    // 16 tokens (as new KV cache blocks are allocated), so within one generate() call,
+    // each graph is used for 16 consecutive tokens. On subsequent generate() calls
+    // at overlapping sequence lengths, cached graphs provide instant replay.
+    //
+    // State machine per max_num_blocks:
+    //   First call:  eager warmup (populates internal caches)
+    //   Second call: capture + launch
+    //   Subsequent:  graph replay
+    //
+    // Using unordered_map for unbounded caching (max_num_blocks can be up to 8192).
+    std::unordered_map<int, hipGraphExec_t> decode_graph_map_;
+    std::unordered_map<int, int> decode_graph_warmup_;  // warmup count per max_num_blocks
+
     // Constants
     static constexpr int num_layers = ModelConfig::num_layers;          // 36
     static constexpr int hidden_size = ModelConfig::hidden_size;        // 2880
@@ -305,6 +321,11 @@ public:
     }
 
     ~Transformer() {
+        for (auto& [k, exec] : decode_graph_map_) {
+            if (exec) hipGraphExecDestroy(exec);
+        }
+        decode_graph_map_.clear();
+        decode_graph_warmup_.clear();
         free_buffers();
     }
 
@@ -582,9 +603,43 @@ public:
                                     num_seqs * sizeof(int32_t),
                                     hipMemcpyHostToDevice, stream));
 
+        // ---------------------------------------------------------------
+        // HIP Graph fast path for B=1 decode on single GPU.
+        //
+        // The entire decode (embedding → 36 layers → final norm → LM head)
+        // is captured as a single HIP graph, eliminating ~580 individual
+        // kernel launch overheads (~5μs each = ~2.9ms total).
+        //
+        // Graph capture requires stable kernel launch grids. Paged attention
+        // uses adaptive splitK that depends on max_num_blocks. We use a fixed
+        // large max_num_blocks for the graph (excess splits early-exit safely).
+        // H2D copies happen before graph launch, updating device buffers
+        // whose addresses are baked into the graph.
+        // ---------------------------------------------------------------
+        decode_kernels(num_seqs, max_num_blocks, stream);
+
+        // Step 5: All-gather logits across TP GPUs
+        PROF("lm_head_allgather", "rccl", device_id_, stream);
+        if (ModelConfig::tp_size > 1) {
+            NCCL_CHECK(ncclAllGather(
+                local_logits_buf_, logits_output,
+                static_cast<size_t>(num_seqs) * tp_vocab_size,
+                ncclBfloat16, nccl_comm_, stream));
+        } else {
+            CUDA_CHECK(hipMemcpyAsync(logits_output, local_logits_buf_,
+                static_cast<size_t>(num_seqs) * tp_vocab_size * sizeof(__hip_bfloat16),
+                hipMemcpyDeviceToDevice, stream));
+        }
+        PROF_END(device_id_, stream);
+    }
+
+    // -----------------------------------------------------------------------
+    // Decode kernel core: embedding → 36 layers → final norm → LM head
+    // Extracted for HIP graph capture — all operations are kernel launches
+    // on `stream`, no host stalls, no H2D copies.
+    // -----------------------------------------------------------------------
+    void decode_kernels(int num_seqs, int max_num_blocks, hipStream_t stream) {
         // Step 1: Embedding lookup
-        // residual_buf_[0] = embedding_table[token_ids]
-        // Shape: [num_seqs, hidden_size]
         PROF("embedding", "embed", device_id_, stream);
         embedding_lookup(
             token_ids_device_, embedding_table_,
@@ -664,8 +719,6 @@ public:
         }
 
         // Step 3: Final RMSNorm
-        // For decode, we process all sequences (each has 1 token)
-        // norm_out_buf_ = RMSNorm(residual)  [num_seqs, hidden_size]
         PROF_LAYER(-1);
         PROF("final_rmsnorm", "norm", device_id_, stream);
         rmsnorm_forward(
@@ -673,11 +726,9 @@ public:
             num_seqs, hidden_size, rms_norm_eps, stream);
         PROF_END(device_id_, stream);
 
-        // Step 4: Column-sharded LM head GEMM
-        // Each GPU: [num_seqs, 2880] x [2880, 100544] -> [num_seqs, 100544]
+        // Step 4: LM head GEMM
         PROF("lm_head_gemm", "gemm", device_id_, stream);
         if (num_seqs == 1) {
-            // Decode B=1: custom GEMV avoids ~1ms hipBLASLt CPU overhead
             gemv_bf16_forward(norm_out_buf_, lm_head_weight_, local_logits_buf_,
                               tp_vocab_size, hidden_size, stream);
         } else {
@@ -685,20 +736,6 @@ public:
                 norm_out_buf_, lm_head_weight_, local_logits_buf_,
                 num_seqs, tp_vocab_size, hidden_size, stream,
                 /*alpha=*/1.0f, /*beta=*/0.0f, /*bias=*/nullptr, /*transB=*/true);
-        }
-        PROF_END(device_id_, stream);
-
-        // Step 5: All-gather logits across TP GPUs
-        PROF("lm_head_allgather", "rccl", device_id_, stream);
-        if (ModelConfig::tp_size > 1) {
-            NCCL_CHECK(ncclAllGather(
-                local_logits_buf_, logits_output,
-                static_cast<size_t>(num_seqs) * tp_vocab_size,
-                ncclBfloat16, nccl_comm_, stream));
-        } else {
-            CUDA_CHECK(hipMemcpyAsync(logits_output, local_logits_buf_,
-                static_cast<size_t>(num_seqs) * tp_vocab_size * sizeof(__hip_bfloat16),
-                hipMemcpyDeviceToDevice, stream));
         }
         PROF_END(device_id_, stream);
     }

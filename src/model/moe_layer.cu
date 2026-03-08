@@ -228,7 +228,9 @@ __global__ void build_fused_gemv_descs_kernel(
     const __hip_bfloat16* input,                     // shared input for all experts
     __hip_bfloat16* output_base,                     // base output buffer
     int output_stride,                               // elements per expert output
-    int gpu_id, int experts_per_gpu, int top_k)
+    int gpu_id, int experts_per_gpu, int top_k,
+    const __hip_bfloat16* bias_table,                // [num_experts, output_stride] or nullptr
+    int bias_stride)                                 // = output_stride (elements per expert bias row)
 {
     int k = threadIdx.x;
     if (k >= top_k) return;
@@ -240,6 +242,7 @@ __global__ void build_fused_gemv_descs_kernel(
     descs[k].packed = packed_table[local_e];
     descs[k].scales = scales_table[local_e];
     descs[k].output = output_base + static_cast<int64_t>(k) * output_stride;
+    descs[k].bias = bias_table ? bias_table + static_cast<int64_t>(global_e) * bias_stride : nullptr;
     descs[k].M = 1;
 }
 
@@ -253,7 +256,9 @@ __global__ void build_fused_gemv_descs_w2_kernel(
     int input_stride,                        // expert_intermediate_size
     __hip_bfloat16* output_base,            // expert_out_buf base
     int output_stride,                       // hidden_size
-    int gpu_id, int experts_per_gpu, int top_k)
+    int gpu_id, int experts_per_gpu, int top_k,
+    const __hip_bfloat16* bias_table,       // [num_experts, output_stride] or nullptr
+    int bias_stride)                         // = output_stride
 {
     int k = threadIdx.x;
     if (k >= top_k) return;
@@ -265,6 +270,7 @@ __global__ void build_fused_gemv_descs_w2_kernel(
     descs[k].packed = packed_table[local_e];
     descs[k].scales = scales_table[local_e];
     descs[k].output = output_base + static_cast<int64_t>(k) * output_stride;
+    descs[k].bias = bias_table ? bias_table + static_cast<int64_t>(global_e) * bias_stride : nullptr;
     descs[k].M = 1;
 }
 
@@ -277,11 +283,156 @@ static void build_fused_gemv_descs(
     __hip_bfloat16* output_base,
     int output_stride,
     int gpu_id, int experts_per_gpu, int top_k,
-    hipStream_t stream)
+    hipStream_t stream,
+    const __hip_bfloat16* bias_table = nullptr,
+    int bias_stride = 0)
 {
     build_fused_gemv_descs_kernel<<<1, top_k, 0, stream>>>(
         d_descs, expert_indices, packed_table, scales_table,
-        input, output_base, output_stride, gpu_id, experts_per_gpu, top_k);
+        input, output_base, output_stride, gpu_id, experts_per_gpu, top_k,
+        bias_table, bias_stride);
+}
+
+// ---------------------------------------------------------------------------
+// Fused bias + SwiGLU kernel for B=1 decode.
+// Reads gate_up output, adds expert bias, applies SwiGLU activation in one pass.
+// Eliminates a kernel launch + HBM round trip vs separate bias_add + swiglu.
+// Input: [top_k, gate_up_size] interleaved [g0,u0,g1,u1,...]
+// Output: [top_k, intermediate_size] where intermediate_size = gate_up_size/2
+// ---------------------------------------------------------------------------
+__global__ void fused_bias_swiglu_decode_kernel(
+    const __hip_bfloat16* __restrict__ gate_up,       // [top_k, gate_up_size]
+    __hip_bfloat16* __restrict__ output,               // [top_k, intermediate_size]
+    const __hip_bfloat16* __restrict__ bias_table,     // [num_experts, gate_up_size]
+    const int32_t* __restrict__ expert_indices,        // [top_k]
+    int intermediate_size, int top_k, float limit)
+{
+    const int gate_up_size = intermediate_size * 2;
+    const int quarter_inter = intermediate_size / 4;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = top_k * quarter_inter;
+    if (idx >= total) return;
+
+    const int k = idx / quarter_inter;
+    const int dim4 = idx % quarter_inter;
+    const int global_e = expert_indices[k];
+
+    // Load 4 interleaved (gate,up) pairs from gate_up
+    const float2* in_ptr = reinterpret_cast<const float2*>(
+        gate_up + k * gate_up_size + dim4 * 8);
+    float2 raw0 = in_ptr[0];
+    float2 raw1 = in_ptr[1];
+
+    // Load corresponding bias values
+    const float2* bias_ptr = reinterpret_cast<const float2*>(
+        bias_table + static_cast<int64_t>(global_e) * gate_up_size + dim4 * 8);
+    float2 bias0 = bias_ptr[0];
+    float2 bias1 = bias_ptr[1];
+
+    // Unpack BF16 pairs
+    __hip_bfloat162 p0 = *reinterpret_cast<__hip_bfloat162*>(&raw0.x);
+    __hip_bfloat162 p1 = *reinterpret_cast<__hip_bfloat162*>(&raw0.y);
+    __hip_bfloat162 p2 = *reinterpret_cast<__hip_bfloat162*>(&raw1.x);
+    __hip_bfloat162 p3 = *reinterpret_cast<__hip_bfloat162*>(&raw1.y);
+
+    __hip_bfloat162 b0 = *reinterpret_cast<__hip_bfloat162*>(&bias0.x);
+    __hip_bfloat162 b1 = *reinterpret_cast<__hip_bfloat162*>(&bias0.y);
+    __hip_bfloat162 b2 = *reinterpret_cast<__hip_bfloat162*>(&bias1.x);
+    __hip_bfloat162 b3 = *reinterpret_cast<__hip_bfloat162*>(&bias1.y);
+
+    // Extract gate and up values, add bias, apply SwiGLU
+    constexpr float alpha = ModelConfig::activation_alpha;
+    float g[4], u[4], r[4];
+
+    g[0] = __bfloat162float(__low2bfloat16(p0))  + __bfloat162float(__low2bfloat16(b0));
+    u[0] = __bfloat162float(__high2bfloat16(p0)) + __bfloat162float(__high2bfloat16(b0));
+    g[1] = __bfloat162float(__low2bfloat16(p1))  + __bfloat162float(__low2bfloat16(b1));
+    u[1] = __bfloat162float(__high2bfloat16(p1)) + __bfloat162float(__high2bfloat16(b1));
+    g[2] = __bfloat162float(__low2bfloat16(p2))  + __bfloat162float(__low2bfloat16(b2));
+    u[2] = __bfloat162float(__high2bfloat16(p2)) + __bfloat162float(__high2bfloat16(b2));
+    g[3] = __bfloat162float(__low2bfloat16(p3))  + __bfloat162float(__low2bfloat16(b3));
+    u[3] = __bfloat162float(__high2bfloat16(p3)) + __bfloat162float(__high2bfloat16(b3));
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        g[i] = fminf(g[i], limit);
+        u[i] = fminf(fmaxf(u[i], -limit), limit);
+        float glu = g[i] / (1.0f + expf(-alpha * g[i]));
+        r[i] = (u[i] + 1.0f) * glu;
+    }
+
+    // Pack and write output
+    float2* out_base = reinterpret_cast<float2*>(output + k * intermediate_size);
+    __hip_bfloat162 r01 = __halves2bfloat162(__float2bfloat16(r[0]), __float2bfloat16(r[1]));
+    __hip_bfloat162 r23 = __halves2bfloat162(__float2bfloat16(r[2]), __float2bfloat16(r[3]));
+    float2 out_raw;
+    out_raw.x = *reinterpret_cast<float*>(&r01);
+    out_raw.y = *reinterpret_cast<float*>(&r23);
+    out_base[dim4] = out_raw;
+}
+
+static void fused_bias_swiglu_decode(
+    const __hip_bfloat16* gate_up,
+    __hip_bfloat16* output,
+    const __hip_bfloat16* bias_table,
+    const int32_t* expert_indices,
+    int intermediate_size, int top_k, float limit,
+    hipStream_t stream)
+{
+    if (!bias_table) return;
+    constexpr int THREADS = 256;
+    int quarter_inter = intermediate_size / 4;
+    int total = top_k * quarter_inter;
+    int blocks = (total + THREADS - 1) / THREADS;
+    fused_bias_swiglu_decode_kernel<<<blocks, THREADS, 0, stream>>>(
+        gate_up, output, bias_table, expert_indices,
+        intermediate_size, top_k, limit);
+}
+
+// ---------------------------------------------------------------------------
+// Fused W2 bias + weighted combine + residual for B=1 decode.
+// Reads expert_outs, adds W2 bias, multiplies by routing weights, sums
+// across experts, and adds residual — all in one kernel pass.
+// ---------------------------------------------------------------------------
+__global__ void fused_bias_combine_kernel(
+    __hip_bfloat16* __restrict__ output,               // [1, hidden_size]
+    const __hip_bfloat16* __restrict__ residual,       // [1, hidden_size]
+    const __hip_bfloat16* __restrict__ expert_outs,    // [top_k, hidden_size]
+    const __hip_bfloat16* __restrict__ bias_table,     // [num_experts, hidden_size]
+    const int32_t* __restrict__ expert_indices,        // [top_k]
+    const float* __restrict__ expert_weights,          // [top_k]
+    int hidden_size, int top_k)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= hidden_size) return;
+
+    float val = __bfloat162float(residual[idx]);
+    for (int k = 0; k < top_k; k++) {
+        float expert_val = __bfloat162float(expert_outs[k * hidden_size + idx]);
+        if (bias_table) {
+            int global_e = expert_indices[k];
+            expert_val += __bfloat162float(bias_table[static_cast<int64_t>(global_e) * hidden_size + idx]);
+        }
+        val += expert_weights[k] * expert_val;
+    }
+    output[idx] = __float2bfloat16(val);
+}
+
+static void fused_bias_combine(
+    __hip_bfloat16* output,
+    const __hip_bfloat16* residual,
+    const __hip_bfloat16* expert_outs,
+    const __hip_bfloat16* bias_table,
+    const int32_t* expert_indices,
+    const float* expert_weights,
+    int hidden_size, int top_k,
+    hipStream_t stream)
+{
+    constexpr int THREADS = 256;
+    int blocks = (hidden_size + THREADS - 1) / THREADS;
+    fused_bias_combine_kernel<<<blocks, THREADS, 0, stream>>>(
+        output, residual, expert_outs, bias_table, expert_indices,
+        expert_weights, hidden_size, top_k);
 }
 
 // ---------------------------------------------------------------------------
@@ -496,6 +647,7 @@ public:
     // ---- Synchronization events ----
     CudaEvent local_done_;      // Signaled after local expert compute completes
     CudaEvent combine_done_;    // Signaled after expert output exchange completes
+    hipEvent_t fast_decode_done_ = nullptr;  // Persistent event for B=1 fast path sync
 
     // ---- Double-buffered dequant pipeline ----
     hipStream_t dequant_stream_ = nullptr;
@@ -694,6 +846,7 @@ public:
             CUDA_CHECK(hipEventCreateWithFlags(&w1_dq_done_[i], hipEventDisableTiming));
         CUDA_CHECK(hipEventCreateWithFlags(&gemm1_done_, hipEventDisableTiming));
         CUDA_CHECK(hipEventCreateWithFlags(&w2_dq_done_, hipEventDisableTiming));
+        CUDA_CHECK(hipEventCreateWithFlags(&fast_decode_done_, hipEventDisableTiming));
 
         // expert_mlp1_bf16_ / expert_mlp2_bf16_ are NOT pre-allocated.
         // Instead, we use shared staging buffers and restructured batching
@@ -767,6 +920,7 @@ public:
         }
         if (gemm1_done_) { hipEventDestroy(gemm1_done_); gemm1_done_ = nullptr; }
         if (w2_dq_done_) { hipEventDestroy(w2_dq_done_); w2_dq_done_ = nullptr; }
+        if (fast_decode_done_) { hipEventDestroy(fast_decode_done_); fast_decode_done_ = nullptr; }
         for (int e = 0; e < experts_per_gpu; ++e) {
             if (expert_mlp1_bf16_[e]) { CUDA_CHECK(hipFree(expert_mlp1_bf16_[e])); expert_mlp1_bf16_[e] = nullptr; }
             if (expert_mlp2_bf16_[e]) { CUDA_CHECK(hipFree(expert_mlp2_bf16_[e])); expert_mlp2_bf16_[e] = nullptr; }
@@ -811,6 +965,14 @@ public:
         hipStream_t main_stream)
     {
         if (num_tokens == 0) return;
+
+        // B=1 fast path: run entirely on main_stream to avoid stream sync overhead.
+        // No compute_stream_ involvement, no event ping-pong.
+        if (num_tokens == 1 && ModelConfig::ep_size <= 1) {
+            forward_core(normed_input, residual_input, output, num_tokens, main_stream);
+            return;
+        }
+
         CudaEvent input_ready;
         input_ready.record(main_stream);
         input_ready.wait(compute_stream_);
@@ -853,6 +1015,86 @@ private:
         int num_tokens,
         hipStream_t main_stream)
     {
+        // =================================================================
+        // FAST PATH: B=1 decode on single GPU — fully GPU-resident, no host stalls.
+        //
+        // Pipeline: router GEMV → topk → [GPU setup descs] → W1 multi-GEMV →
+        //           bias_add → SwiGLU → [GPU setup descs] → W2 multi-GEMV →
+        //           bias_add → fast_combine+residual
+        //
+        // Eliminates: permute_classify, D2H copies, hipStreamSynchronize,
+        //             CPU gather_map, H2D, scatter_tokens, EP exchange.
+        // =================================================================
+        if (num_tokens == 1 && ModelConfig::ep_size <= 1) {
+            // For B=1 on single GPU, forward_prenormed routes us here on
+            // main_stream directly — no compute_stream_ involvement, zero
+            // stream sync overhead.
+            hipStream_t s = main_stream;
+
+            ensure_grouped_staging(device_id_, top_k);
+            GroupedGemmStaging& stg = s_staging[device_id_];
+
+            // Step 1: Router GEMV + TopK (on GPU, no host involvement)
+            PROF("router_gemm", "moe_sub", device_id_, s);
+            gemv_bf16_forward(normed, router_weight_, router_logits_buf_,
+                              num_experts, hidden_size, s, router_bias_);
+            PROF_END(device_id_, s);
+
+            PROF("topk_softmax", "moe_sub", device_id_, s);
+            topk_softmax_forward(
+                router_logits_buf_, expert_indices_buf_, expert_weights_buf_,
+                tokens_per_expert_, 1, num_experts, top_k,
+                gpu_id_, experts_per_gpu, s);
+            PROF_END(device_id_, s);
+
+            // Step 2: W1 GEMV (4 experts, 1 launch) — GPU builds descriptors
+            PROF("w1_fused_gemv", "moe_sub", device_id_, s);
+            build_fused_gemv_descs(
+                d_fused_descs_, expert_indices_buf_,
+                d_mlp1_packed_, d_mlp1_scales_,
+                normed, stg.gate_up, expert_gate_up_size,
+                gpu_id_, experts_per_gpu, top_k, s);
+            fused_mxfp4_gemv_multi_forward(
+                d_fused_descs_, expert_gate_up_size, hidden_size, top_k, s);
+            PROF_END(device_id_, s);
+
+            // Step 3+4: Fused bias + SwiGLU (single kernel, saves launch + HBM round trip)
+            PROF("bias_swiglu", "moe_sub", device_id_, s);
+            fused_bias_swiglu_decode(
+                stg.gate_up, stg.swiglu,
+                gate_up_proj_bias_, expert_indices_buf_,
+                expert_intermediate_size, top_k, swiglu_limit, s);
+            PROF_END(device_id_, s);
+
+            // Step 5: W2 GEMV (4 experts, 1 launch) — GPU builds descriptors
+            PROF("w2_fused_gemv", "moe_sub", device_id_, s);
+            build_fused_gemv_descs_w2_kernel<<<1, top_k, 0, s>>>(
+                d_fused_descs_, expert_indices_buf_,
+                d_mlp2_packed_, d_mlp2_scales_,
+                stg.swiglu, expert_intermediate_size,
+                expert_out_buf_, hidden_size,
+                gpu_id_, experts_per_gpu, top_k,
+                nullptr, 0);
+            fused_mxfp4_gemv_multi_forward(
+                d_fused_descs_, hidden_size, expert_intermediate_size, top_k, s);
+            PROF_END(device_id_, s);
+
+            // Step 6: W2 bias add (GPU-side)
+            expert_bias_add_decode(
+                expert_out_buf_, down_proj_bias_, expert_indices_buf_,
+                hidden_size, top_k, s);
+
+            // Step 7: Weighted combine + residual add (no gather_map needed)
+            PROF("combine", "moe_sub", device_id_, s);
+            moe_fast_combine(
+                output, residual, expert_out_buf_, expert_weights_buf_,
+                hidden_size, top_k, s);
+            PROF_END(device_id_, s);
+
+            // No sync needed — everything ran on main_stream, GPU ordering guaranteed.
+            return;
+        }
+
         // -----------------------------------------------------------------
         // Steps 2-3: Router GEMM + TopK Routing
         //
