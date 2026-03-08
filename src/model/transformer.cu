@@ -28,44 +28,6 @@
 #include "nccl_utils.h"
 #include "profiler.h"
 
-// Diagnostic: compute RMS norm of a BF16 buffer on GPU
-static float diag_rms(const __hip_bfloat16* d_buf, int n, hipStream_t stream) {
-    CUDA_CHECK(hipStreamSynchronize(stream));
-    std::vector<__hip_bfloat16> h(n);
-    CUDA_CHECK(hipMemcpy(h.data(), d_buf, n * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-    double sum = 0;
-    for (int i = 0; i < n; i++) {
-        float v = __bfloat162float(h[i]);
-        sum += (double)v * v;
-    }
-    return (float)std::sqrt(sum / n);
-}
-
-// Diagnostic: print first 8 values of token 0 in a [num_tokens, hidden_size] buffer
-static void diag_first8(const char* label, const __hip_bfloat16* d_buf, int hidden_size, hipStream_t stream) {
-    CUDA_CHECK(hipStreamSynchronize(stream));
-    __hip_bfloat16 h[8];
-    int n = (hidden_size < 8) ? hidden_size : 8;
-    CUDA_CHECK(hipMemcpy(h, d_buf, n * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-    fprintf(stderr, "%s first8=[", label);
-    for (int i = 0; i < n; i++)
-        fprintf(stderr, "%s%.6f", i ? ", " : "", __bfloat162float(h[i]));
-    fprintf(stderr, "]\n");
-}
-
-// Diagnostic: compute per-token RMS for token 0 in [num_tokens, hidden_size]
-static float diag_token0_rms(const __hip_bfloat16* d_buf, int hidden_size, hipStream_t stream) {
-    CUDA_CHECK(hipStreamSynchronize(stream));
-    std::vector<__hip_bfloat16> h(hidden_size);
-    CUDA_CHECK(hipMemcpy(h.data(), d_buf, hidden_size * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-    double sum = 0;
-    for (int i = 0; i < hidden_size; i++) {
-        float v = __bfloat162float(h[i]);
-        sum += (double)v * v;
-    }
-    return (float)std::sqrt(sum / hidden_size);
-}
-
 namespace gptoss {
 
 // ---------------------------------------------------------------------------
@@ -436,12 +398,6 @@ public:
             seq_len, hidden_size, stream);
         PROF_END(device_id_, stream);
 
-        if (device_id_ == 0) {
-            float emb_rms = diag_token0_rms(residual_buf_[0], hidden_size, stream);
-            fprintf(stderr, "[DIAG GPU%d] After embedding: token0_rms=%.6f\n", device_id_, emb_rms);
-            diag_first8("[DIAG GPU0] embedding token0", residual_buf_[0], hidden_size, stream);
-        }
-
         // Step 2: Forward through all 36 layers
         // We ping-pong between residual_buf_[0] and residual_buf_[1]
         // to avoid extra copies. Each layer reads from one buffer and
@@ -465,17 +421,6 @@ public:
                 seq_len,
                 stream);
             PROF_END(device_id_, stream);
-
-            // Diagnostic: per-layer attention output
-            if (device_id_ == 0) {
-                float attn_rms = diag_token0_rms(residual_buf_[dst_buf], hidden_size, stream);
-                fprintf(stderr, "[DIAG GPU%d] L%d after_attn: token0_rms=%.6f\n", device_id_, layer, attn_rms);
-                if (layer <= 5) {
-                    char lbl[64];
-                    snprintf(lbl, sizeof(lbl), "[DIAG GPU0] L%d attn_out token0", layer);
-                    diag_first8(lbl, residual_buf_[dst_buf], hidden_size, stream);
-                }
-            }
 
             // EP hidden-state sync: With TP=1, each GPU computes attention
             // independently. Floating-point non-determinism across devices
@@ -509,17 +454,6 @@ public:
             // the same EP communicator from a different stream.
             CUDA_CHECK(hipStreamSynchronize(stream));
 
-            // Diagnostic: per-layer MoE output (full residual after both sublayers)
-            if (device_id_ == 0) {
-                float rms = diag_token0_rms(residual_buf_[src_buf], hidden_size, stream);
-                fprintf(stderr, "[DIAG GPU%d] L%d after_moe: token0_rms=%.6f\n", device_id_, layer, rms);
-                if (layer <= 5) {
-                    char lbl[64];
-                    snprintf(lbl, sizeof(lbl), "[DIAG GPU0] L%d moe_out token0", layer);
-                    diag_first8(lbl, residual_buf_[src_buf], hidden_size, stream);
-                }
-            }
-
             // After both sub-layers, the result is in residual_buf_[src_buf]
             // (same buffer we started with), ready for the next layer.
         }
@@ -540,15 +474,6 @@ public:
             last_hidden_buf_, final_norm_weight_, norm_out_buf_,
             1, hidden_size, rms_norm_eps, stream);
         PROF_END(device_id_, stream);
-
-        if (device_id_ == 0) {
-            float lh_rms = diag_token0_rms(last_hidden_buf_, hidden_size, stream);
-            float norm_rms = diag_token0_rms(norm_out_buf_, hidden_size, stream);
-            fprintf(stderr, "[DIAG GPU%d] Last hidden rms=%.6f, after norm rms=%.6f\n",
-                    device_id_, lh_rms, norm_rms);
-            diag_first8("[DIAG GPU0] last_hidden", last_hidden_buf_, hidden_size, stream);
-            diag_first8("[DIAG GPU0] after_norm", norm_out_buf_, hidden_size, stream);
-        }
 
         // Step 5: Column-sharded LM head GEMM
         // Each GPU computes logits for its vocab partition only.

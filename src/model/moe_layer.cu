@@ -31,31 +31,6 @@
 #include "cuda_utils.h"
 #include "nccl_utils.h"
 
-// Diagnostic: compute RMS of first row in [rows, cols] buffer
-static float moe_diag_rms(const __hip_bfloat16* d_buf, int cols, hipStream_t stream) {
-    CUDA_CHECK(hipStreamSynchronize(stream));
-    std::vector<__hip_bfloat16> h(cols);
-    CUDA_CHECK(hipMemcpy(h.data(), d_buf, cols * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-    double sum = 0;
-    for (int i = 0; i < cols; i++) {
-        float v = __bfloat162float(h[i]);
-        sum += (double)v * v;
-    }
-    return (float)std::sqrt(sum / cols);
-}
-
-static void moe_diag_first8(const char* label, const __hip_bfloat16* d_buf, int cols, hipStream_t stream) {
-    CUDA_CHECK(hipStreamSynchronize(stream));
-    __hip_bfloat16 h[8];
-    int n = (cols < 8) ? cols : 8;
-    CUDA_CHECK(hipMemcpy(h, d_buf, n * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-    fprintf(stderr, "%s first8=[", label);
-    for (int i = 0; i < n; i++)
-        fprintf(stderr, "%s%.6f", i ? ", " : "", __bfloat162float(h[i]));
-    fprintf(stderr, "]\n");
-}
-
-
 namespace gptoss {
 
 // ---------------------------------------------------------------------------
@@ -794,34 +769,6 @@ private:
         // Now all pinned host arrays are valid from the sync above.
         int total_local_tokens = h_expert_offsets_pinned_[experts_per_gpu];
 
-        // Single-GPU diagnostic: verify routing produces non-zero local tokens
-        if (layer_id_ <= 0 && device_id_ == 0) {
-            fprintf(stderr, "[MoE L%d] total_local_tokens=%d (num_tokens=%d, top_k=%d, experts_per_gpu=%d, ep_size=%d)\n",
-                    layer_id_, total_local_tokens, num_tokens, top_k, experts_per_gpu,
-                    ModelConfig::ep_size);
-            // Dump expert_indices for token 0
-            int32_t ei[4];
-            CUDA_CHECK(hipMemcpy(ei, expert_indices_buf_, std::min(4, num_tokens*top_k) * sizeof(int32_t), hipMemcpyDeviceToHost));
-            fprintf(stderr, "[MoE L%d] expert_indices[0..3]=[%d,%d,%d,%d]\n",
-                    layer_id_, ei[0], ei[1], ei[2], ei[3]);
-            // Dump expert_offsets
-            int32_t eo[5];
-            int noff = std::min(5, experts_per_gpu + 1);
-            CUDA_CHECK(hipMemcpy(eo, expert_offsets_, noff * sizeof(int32_t), hipMemcpyDeviceToHost));
-            fprintf(stderr, "[MoE L%d] expert_offsets[0..4]=[%d,%d,%d,%d,%d]\n",
-                    layer_id_, eo[0], eo[1], eo[2], eo[3], eo[4]);
-            // Dump local_expert_counts
-            int32_t lec[5];
-            CUDA_CHECK(hipMemcpy(lec, local_expert_counts_, std::min(5, experts_per_gpu) * sizeof(int32_t), hipMemcpyDeviceToHost));
-            fprintf(stderr, "[MoE L%d] local_expert_counts[0..4]=[%d,%d,%d,%d,%d]\n",
-                    layer_id_, lec[0], lec[1], lec[2], lec[3], lec[4]);
-            // Dump per_peer_counts
-            int32_t ppc[2];
-            CUDA_CHECK(hipMemcpy(ppc, per_peer_counts_, std::min(2, (int)ModelConfig::ep_size) * sizeof(int32_t), hipMemcpyDeviceToHost));
-            fprintf(stderr, "[MoE L%d] per_peer_counts[0..1]=[%d,%d]\n",
-                    layer_id_, ppc[0], ModelConfig::ep_size > 1 ? ppc[1] : -1);
-        }
-
         // -----------------------------------------------------------------
         // Step 5: Expert GEMMs -- Double-buffered dequant pipeline
         //
@@ -1015,25 +962,6 @@ private:
 
         }
 
-        // ----- MoE internal diagnostics (layers 2-3, both GPUs) -----
-        bool diag = (layer_id_ >= 2 && layer_id_ <= 3 && num_tokens > 1);
-        if (diag && gpu_id_ == 0) {
-            float normed_rms = moe_diag_rms(normed, hidden_size, compute_stream_);
-            float expert_rms = moe_diag_rms(expert_out_buf_, hidden_size, compute_stream_);
-            fprintf(stderr, "[MoE DIAG GPU0 L%d] num_tokens=%d, normed_rms=%.6f, expert_out_rms=%.6f, total_local_tokens=%d\n",
-                    layer_id_, num_tokens, normed_rms, expert_rms, total_local_tokens);
-            fprintf(stderr, "[MoE DIAG GPU0 L%d] peer_counts=[%d,%d], peer_offsets=[%d,%d]\n",
-                    layer_id_,
-                    h_per_peer_counts_pinned_[0], h_per_peer_counts_pinned_[1],
-                    h_peer_recv_offsets_pinned_[0], h_peer_recv_offsets_pinned_[1]);
-            {
-                int32_t ei[4];
-                CUDA_CHECK(hipMemcpy(ei, expert_indices_buf_, 4 * sizeof(int32_t), hipMemcpyDeviceToHost));
-                fprintf(stderr, "[MoE DIAG GPU0 L%d] token0_expert_indices=[%d,%d,%d,%d]\n",
-                        layer_id_, ei[0], ei[1], ei[2], ei[3]);
-            }
-        }
-
         // -----------------------------------------------------------------
         // Step 6: Exchange expert outputs via N-way grouped P2P
         // -----------------------------------------------------------------
@@ -1062,24 +990,6 @@ private:
             CUDA_CHECK(hipEventDestroy(nccl_done));
         }
 
-        if (diag && gpu_id_ == 0) {
-            CUDA_CHECK(hipStreamSynchronize(comm_stream_));
-            CUDA_CHECK(hipStreamSynchronize(compute_stream_));
-            float recv_rms = moe_diag_rms(recv_buffer_, hidden_size, compute_stream_);
-            fprintf(stderr, "[MoE DIAG GPU0 L%d] after_rccl: recv_buf_rms=%.6f\n", layer_id_, recv_rms);
-
-            // Print gather_map for token 0 (4 values)
-            {
-                int32_t gm[4];
-                CUDA_CHECK(hipMemcpy(gm, gather_map_, 4 * sizeof(int32_t), hipMemcpyDeviceToHost));
-                fprintf(stderr, "[MoE DIAG GPU0 L%d] token0_gather_map=[%d,%d,%d,%d]\n",
-                        layer_id_, gm[0], gm[1], gm[2], gm[3]);
-            }
-
-            float res_rms = moe_diag_rms(residual, hidden_size, compute_stream_);
-            fprintf(stderr, "[MoE DIAG GPU0 L%d] residual_rms=%.6f\n", layer_id_, res_rms);
-        }
-
         // -----------------------------------------------------------------
         // Steps 7+8 fused: Combine + residual add in one kernel
         //
@@ -1104,79 +1014,6 @@ private:
             num_tokens, hidden_size, top_k,
             compute_stream_);
         PROF_END(device_id_, compute_stream_);
-
-        if (diag && gpu_id_ == 0) {
-            CUDA_CHECK(hipStreamSynchronize(compute_stream_));
-
-            // Manual combine verification for token 0
-            // Read gather_map, weights, expert_out, recv_buffer, residual, output
-            int32_t gm[4];
-            float ew[4];
-            CUDA_CHECK(hipMemcpy(gm, gather_map_, 4 * sizeof(int32_t), hipMemcpyDeviceToHost));
-            CUDA_CHECK(hipMemcpy(ew, expert_weights_buf_, 4 * sizeof(float), hipMemcpyDeviceToHost));
-
-            fprintf(stderr, "[MoE VERIFY GPU0 L%d] token0 gather_map=[%d,%d,%d,%d] weights=[%.4f,%.4f,%.4f,%.4f]\n",
-                    layer_id_, gm[0], gm[1], gm[2], gm[3], ew[0], ew[1], ew[2], ew[3]);
-
-            // Read first 8 BF16 values from each expert output for token 0
-            for (int k = 0; k < 4; ++k) {
-                __hip_bfloat16 vals[8];
-                if (gm[k] >= 0) {
-                    size_t off = static_cast<size_t>(gm[k]) * hidden_size;
-                    CUDA_CHECK(hipMemcpy(vals, expert_out_buf_ + off, 8 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                    fprintf(stderr, "[MoE VERIFY GPU0 L%d] slot%d: LOCAL[%d] first4=[%.4f,%.4f,%.4f,%.4f]\n",
-                            layer_id_, k, gm[k],
-                            __bfloat162float(vals[0]), __bfloat162float(vals[1]),
-                            __bfloat162float(vals[2]), __bfloat162float(vals[3]));
-                } else {
-                    int ri = -(gm[k] + 1);
-                    size_t off = static_cast<size_t>(ri) * hidden_size;
-                    CUDA_CHECK(hipMemcpy(vals, recv_buffer_ + off, 8 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                    fprintf(stderr, "[MoE VERIFY GPU0 L%d] slot%d: REMOTE[%d] first4=[%.4f,%.4f,%.4f,%.4f]\n",
-                            layer_id_, k, ri,
-                            __bfloat162float(vals[0]), __bfloat162float(vals[1]),
-                            __bfloat162float(vals[2]), __bfloat162float(vals[3]));
-                }
-            }
-
-            // Read residual token 0 first 4 values
-            __hip_bfloat16 res_vals[4];
-            CUDA_CHECK(hipMemcpy(res_vals, residual, 4 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-
-            // Read output token 0 first 4 values
-            __hip_bfloat16 out_vals[4];
-            CUDA_CHECK(hipMemcpy(out_vals, output, 4 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-
-            // Manual combine for position 0
-            float manual[4] = {0, 0, 0, 0};
-            for (int k = 0; k < 4; ++k) {
-                __hip_bfloat16 expert_v[4];
-                if (gm[k] >= 0) {
-                    size_t off = static_cast<size_t>(gm[k]) * hidden_size;
-                    CUDA_CHECK(hipMemcpy(expert_v, expert_out_buf_ + off, 4 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                } else {
-                    int ri = -(gm[k] + 1);
-                    size_t off = static_cast<size_t>(ri) * hidden_size;
-                    CUDA_CHECK(hipMemcpy(expert_v, recv_buffer_ + off, 4 * sizeof(__hip_bfloat16), hipMemcpyDeviceToHost));
-                }
-                for (int i = 0; i < 4; ++i)
-                    manual[i] += ew[k] * __bfloat162float(expert_v[i]);
-            }
-            for (int i = 0; i < 4; ++i)
-                manual[i] += __bfloat162float(res_vals[i]);
-
-            fprintf(stderr, "[MoE VERIFY GPU0 L%d] residual[0..3]=[%.4f,%.4f,%.4f,%.4f]\n",
-                    layer_id_, __bfloat162float(res_vals[0]), __bfloat162float(res_vals[1]),
-                    __bfloat162float(res_vals[2]), __bfloat162float(res_vals[3]));
-            fprintf(stderr, "[MoE VERIFY GPU0 L%d] manual[0..3]=[%.4f,%.4f,%.4f,%.4f]\n",
-                    layer_id_, manual[0], manual[1], manual[2], manual[3]);
-            fprintf(stderr, "[MoE VERIFY GPU0 L%d] kernel[0..3]=[%.4f,%.4f,%.4f,%.4f]\n",
-                    layer_id_, __bfloat162float(out_vals[0]), __bfloat162float(out_vals[1]),
-                    __bfloat162float(out_vals[2]), __bfloat162float(out_vals[3]));
-
-            float out_rms = moe_diag_rms(output, hidden_size, compute_stream_);
-            fprintf(stderr, "[MoE VERIFY GPU0 L%d] output_rms=%.6f\n", layer_id_, out_rms);
-        }
 
         // Drain both MoE streams before returning to main_stream.
         // The combine kernel on compute_stream_ reads recv_buffer_ (written
