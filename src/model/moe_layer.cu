@@ -907,10 +907,9 @@ private:
             PROF_END(device_id_, compute_stream_);
 
             // ROCm workaround: hipBLASLt may not properly respect stream
-            // ordering after custom HIP kernels on MI300X.  Record an event
-            // after dequant and wait on it before GEMM as a GPU-side barrier.
-            CUDA_CHECK(hipEventRecord(w1_dq_done_[0], compute_stream_));
-            CUDA_CHECK(hipStreamWaitEvent(compute_stream_, w1_dq_done_[0], 0));
+            // ordering after custom HIP kernels on MI300X.  Without this
+            // barrier the GEMM can read stale dequant buffers.
+            CUDA_CHECK(hipStreamSynchronize(compute_stream_));
 
             // -- Build MLP1 GEMM arrays --
             const __hip_bfloat16* mlp1_A[GROUPED_BATCH_SIZE];
@@ -977,8 +976,7 @@ private:
             PROF_END(device_id_, compute_stream_);
 
             // ROCm workaround: same as W1 above
-            CUDA_CHECK(hipEventRecord(w2_dq_done_, compute_stream_));
-            CUDA_CHECK(hipStreamWaitEvent(compute_stream_, w2_dq_done_, 0));
+            CUDA_CHECK(hipStreamSynchronize(compute_stream_));
 
             // -- Build MLP2 GEMM arrays (reads from bank[0]) --
             const __hip_bfloat16* mlp2_A[GROUPED_BATCH_SIZE];
