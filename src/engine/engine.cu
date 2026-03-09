@@ -857,7 +857,7 @@ private:
 
     void init_subsystems() {
         constexpr int NL = ModelConfig::num_layers;
-        constexpr int MAX_TOKENS = 2048;
+        constexpr int MAX_TOKENS = 8192;
         constexpr int hidden = ModelConfig::hidden_size;
         constexpr int tp_qkv = ModelConfig::tp_qkv_size;
         constexpr int tp_q   = ModelConfig::tp_q_dim;
@@ -879,7 +879,7 @@ private:
 
             // Reserve headroom for layer scratch, transformer buffers, hipBLAS workspace.
             // Attn scratch ~60MB + MoE scratch ~600MB + transformer ~1.5GB + hipBLAS ~256MB
-            constexpr size_t KV_HEADROOM = 6ULL * 1024 * 1024 * 1024; // 6 GB
+            constexpr size_t KV_HEADROOM = 10ULL * 1024 * 1024 * 1024; // 10 GB
 
             constexpr int kv_max_blocks_per_seq =
                 (ModelConfig::rope_max_pos + ModelConfig::kv_block_size - 1) / ModelConfig::kv_block_size;

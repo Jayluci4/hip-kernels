@@ -767,12 +767,14 @@ private:
         // norm_out_buf needs to hold [max_tokens, hidden_size] for decode
         CUDA_CHECK(hipMalloc(&norm_out_buf_, residual_bytes));
 
-        // Full logits buffer: [max_tokens, vocab_size] -- receives all-gather output
-        int64_t logits_bytes = static_cast<int64_t>(max_tokens_) * vocab_size * sizeof(__hip_bfloat16);
+        // Logits buffers: only need max(1, max_batch_size) rows, not max_tokens.
+        // Prefill extracts last token's hidden state, so logits are always single-row.
+        // Decode produces one logit row per sequence in the batch.
+        int logits_rows = std::max(1, ModelConfig::max_batch_size);
+        int64_t logits_bytes = static_cast<int64_t>(logits_rows) * vocab_size * sizeof(__hip_bfloat16);
         CUDA_CHECK(hipMalloc(&logits_buf_, logits_bytes));
 
-        // Local logits buffer: [max_tokens, tp_vocab_size] -- this GPU's partial logits
-        int64_t local_logits_bytes = static_cast<int64_t>(max_tokens_) * tp_vocab_size * sizeof(__hip_bfloat16);
+        int64_t local_logits_bytes = static_cast<int64_t>(logits_rows) * tp_vocab_size * sizeof(__hip_bfloat16);
         CUDA_CHECK(hipMalloc(&local_logits_buf_, local_logits_bytes));
 
         // Last hidden state: [1, hidden_size] for prefill
