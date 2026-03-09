@@ -139,7 +139,8 @@ extern void transformer_init(Transformer* t, int rank, ncclComm_t nccl_comm,
                               int max_tokens);
 extern void transformer_prefill(Transformer* t, const int* token_ids_host,
                                  const int* positions_host, int seq_len,
-                                 __hip_bfloat16* logits_output);
+                                 __hip_bfloat16* logits_output,
+                                 const int32_t* slot_mapping_host = nullptr);
 extern void transformer_decode(Transformer* t, const int* token_ids_host,
                                 const int* positions_host, const int32_t* slot_mapping_host,
                                 const int32_t* block_table_host, const int32_t* seq_lens_host,
@@ -349,7 +350,11 @@ public:
         set_l2_persistence();
 
         // ---- Step 7: Pre-allocate decode state ----
-        decode_state_.init();
+        {
+            int total_blocks = kv_cache_manager_num_blocks(gpus_[0].kv_cache);
+            int blocks_per_layer = total_blocks / ModelConfig::num_layers;
+            decode_state_.init(blocks_per_layer);
+        }
 
         // ---- Step 8: Warm up ----
         warmup();
@@ -454,6 +459,147 @@ public:
         }
 
         return output_tokens;
+    }
+
+    // ------------------------------------------------------------------
+    // Batched autoregressive generation
+    // ------------------------------------------------------------------
+    std::vector<std::vector<int32_t>> generate_batch(
+            const std::vector<std::vector<int32_t>>& prompts,
+            int max_tokens     = 512,
+            float temperature  = 0.0f,
+            float top_p        = 1.0f) {
+        if (!initialized_) {
+            throw std::runtime_error("[InferenceEngine] Not initialized");
+        }
+        const int B = static_cast<int>(prompts.size());
+        if (B == 0) {
+            throw std::runtime_error("[InferenceEngine] Empty batch");
+        }
+        if (B > ModelConfig::max_batch_size) {
+            throw std::runtime_error("[InferenceEngine] Batch size exceeds max_batch_size");
+        }
+        if (max_tokens <= 0) {
+            throw std::runtime_error("[InferenceEngine] max_tokens must be > 0");
+        }
+
+        // All prompts must have the same length for batched decode
+        // (different lengths would need padding or continuous batching)
+        const int prompt_len = static_cast<int>(prompts[0].size());
+        for (int i = 1; i < B; ++i) {
+            if (static_cast<int>(prompts[i].size()) != prompt_len) {
+                throw std::runtime_error(
+                    "[InferenceEngine] All prompts must have the same length for batched generation");
+            }
+        }
+
+        fprintf(stderr, "[InferenceEngine::generate_batch] B=%d, prompt_len=%d, max_tokens=%d\n",
+                B, prompt_len, max_tokens);
+
+        // Reconfigure block table for this batch size
+        decode_state_.setup_block_table(B);
+
+        // Verify the KV cache can hold the full generation
+        int total_tokens_per_seq = prompt_len + max_tokens;
+        int blocks_needed = (total_tokens_per_seq + ModelConfig::kv_block_size - 1)
+                          / ModelConfig::kv_block_size;
+        if (blocks_needed > decode_state_.blocks_per_seq) {
+            fprintf(stderr, "[InferenceEngine] ERROR: B=%d needs %d blocks/seq (%d tokens) "
+                    "but only %d blocks/seq available\n",
+                    B, blocks_needed, total_tokens_per_seq, decode_state_.blocks_per_seq);
+            throw std::runtime_error("[InferenceEngine] KV cache too small for batch_size * seq_len");
+        }
+
+        // Output accumulators: one per sequence
+        std::vector<std::vector<int32_t>> outputs(B);
+        for (int i = 0; i < B; ++i) {
+            outputs[i] = prompts[i];
+            outputs[i].reserve(prompt_len + max_tokens);
+        }
+
+        // Track which sequences are still active (not EOS)
+        std::vector<bool> active(B, true);
+
+        // ---- Prefill phase ----
+        // Process each prompt sequentially and sample immediately.
+        // Prefill overwrites the shared device_logits_bf16 buffer,
+        // so we must convert + sample before the next prompt overwrites it.
+        std::vector<int32_t> next_tokens(B);
+        for (int i = 0; i < B; ++i) {
+            run_prefill_seq(prompts[i], /*seq_id=*/i);
+            convert_and_copy_logits(1);
+            next_tokens[i] = sample(gpus_[0].host_logits, temperature, top_p);
+            outputs[i].push_back(next_tokens[i]);
+            if (next_tokens[i] == EOS_TOKEN_ID) {
+                active[i] = false;
+            }
+        }
+
+        // ---- Decode phase ----
+        // Now run batched decode steps. All B sequences advance together.
+        const int V = ModelConfig::vocab_size;
+
+        for (int step = 0; step < max_tokens - 1; ++step) {
+            // Check if all sequences are done
+            bool any_active = false;
+            for (int i = 0; i < B; ++i) {
+                if (active[i]) { any_active = true; break; }
+            }
+            if (!any_active) break;
+
+            int position = prompt_len + step;
+
+            // Fill decode state for all B sequences
+            int max_num_blocks = (position + 1 + ModelConfig::kv_block_size - 1)
+                               / ModelConfig::kv_block_size;
+
+            for (int i = 0; i < B; ++i) {
+                decode_state_.token_ids[i]    = next_tokens[i];
+                decode_state_.positions[i]    = position;
+                decode_state_.slot_mapping[i] = i * decode_state_.blocks_per_seq * ModelConfig::kv_block_size + position;
+                decode_state_.seq_lens[i]     = position + 1;
+            }
+
+            // Pack block table: [B][max_num_blocks] from full [MAX_BATCH][blocks_per_seq]
+            decode_state_.packed_block_table.resize(static_cast<size_t>(B) * max_num_blocks);
+            for (int i = 0; i < B; ++i) {
+                const int32_t* src = decode_state_.block_table.data()
+                                   + i * decode_state_.blocks_per_seq;
+                int32_t* dst = decode_state_.packed_block_table.data()
+                             + i * max_num_blocks;
+                std::memcpy(dst, src, max_num_blocks * sizeof(int32_t));
+            }
+
+            // Launch batched decode on ALL GPUs concurrently
+            std::vector<std::thread> threads;
+            for (int r = 0; r < NUM_GPUS; ++r) {
+                threads.emplace_back(&InferenceEngine::run_gpu_decode, this,
+                                     r, decode_state_.token_ids, decode_state_.positions,
+                                     decode_state_.slot_mapping,
+                                     decode_state_.packed_block_table.data(),
+                                     decode_state_.seq_lens, B, max_num_blocks);
+            }
+            for (auto& t : threads) t.join();
+
+            // Convert and copy B logits vectors
+            convert_and_copy_logits(B);
+
+            // Sample next token for each sequence
+            for (int i = 0; i < B; ++i) {
+                if (!active[i]) {
+                    next_tokens[i] = PAD_TOKEN_ID;
+                    continue;
+                }
+                const float* seq_logits = gpus_[0].host_logits + i * V;
+                next_tokens[i] = sample(seq_logits, temperature, top_p);
+                outputs[i].push_back(next_tokens[i]);
+                if (next_tokens[i] == EOS_TOKEN_ID) {
+                    active[i] = false;
+                }
+            }
+        }
+
+        return outputs;
     }
 
     // ------------------------------------------------------------------
@@ -672,15 +818,18 @@ private:
         gpu.cublas.init(rank, gpu.compute_stream);
 
         // Device-side logits buffers: BF16 (written by Transformer) and FP32 (for conversion)
+        // Sized for max_batch_size sequences to support batched decode.
+        constexpr size_t max_logits = static_cast<size_t>(ModelConfig::max_batch_size)
+                                    * ModelConfig::vocab_size;
         CUDA_CHECK(hipMalloc(&gpu.device_logits_bf16,
-                              ModelConfig::vocab_size * sizeof(__hip_bfloat16)));
+                              max_logits * sizeof(__hip_bfloat16)));
         CUDA_CHECK(hipMalloc(&gpu.device_logits_fp32,
-                              ModelConfig::vocab_size * sizeof(float)));
+                              max_logits * sizeof(float)));
 
         // Pinned host buffer for logits transfer (only need GPU 0's)
         if (rank == 0) {
             CUDA_CHECK(hipHostMalloc(&gpu.host_logits,
-                                      ModelConfig::vocab_size * sizeof(float)));
+                                      max_logits * sizeof(float)));
         }
 
         fprintf(stderr, "[InferenceEngine] GPU %d resources initialized.\n", rank);
@@ -943,6 +1092,17 @@ private:
         CUDA_CHECK(hipStreamSynchronize(stream));
     }
 
+    // Prefill variant with explicit slot_mapping for batched KV cache
+    void run_gpu_prefill_seq(int r, const int32_t* tokens, const int* positions,
+                             const int32_t* slot_mapping, int seq_len) {
+        CUDA_CHECK(hipSetDevice(r));
+        auto& gpu = gpus_[r];
+        transformer_prefill(gpu.model, tokens, positions, seq_len,
+                            gpu.device_logits_bf16, slot_mapping);
+        hipStream_t stream = transformer_compute_stream(gpu.model);
+        CUDA_CHECK(hipStreamSynchronize(stream));
+    }
+
     // Helper: run transformer_decode on a specific GPU in its own thread.
     void run_gpu_decode(int r, const int32_t* token_ids, const int* positions,
                         const int32_t* slot_mapping, const int32_t* block_table,
@@ -994,7 +1154,39 @@ private:
     // Inference methods
     // ==================================================================
 
-    // Run prefill on both GPUs with the full prompt.
+    // Run prefill for a specific sequence in the batch.
+    // seq_id determines where in the KV cache this sequence's data goes.
+    void run_prefill_seq(const std::vector<int32_t>& prompt_tokens, int seq_id) {
+        const int seq_len = static_cast<int>(prompt_tokens.size());
+
+        // Build positions array: [0, 1, 2, ..., seq_len-1]
+        std::vector<int> positions(seq_len);
+        for (int i = 0; i < seq_len; ++i) positions[i] = i;
+
+        // Build slot_mapping: each token maps to a unique KV cache slot.
+        // Sequence seq_id uses physical slots starting at
+        // seq_id * blocks_per_seq * kv_block_size.
+        const int slot_base = seq_id * decode_state_.blocks_per_seq
+                            * ModelConfig::kv_block_size;
+        std::vector<int32_t> slot_mapping(seq_len);
+        for (int i = 0; i < seq_len; ++i) {
+            slot_mapping[i] = slot_base + i;
+        }
+
+        // Launch on ALL GPUs concurrently
+        std::vector<std::thread> threads;
+        for (int r = 0; r < NUM_GPUS; ++r) {
+            threads.emplace_back(&InferenceEngine::run_gpu_prefill_seq, this,
+                                 r, prompt_tokens.data(), positions.data(),
+                                 slot_mapping.data(), seq_len);
+        }
+        for (auto& t : threads) t.join();
+
+        // Convert BF16 logits to FP32 on GPU 0 (single sequence logits)
+        // Caller is responsible for calling convert_and_copy_logits().
+    }
+
+    // Run prefill on both GPUs with the full prompt (legacy B=1 path).
     // Writes FP32 logits to gpus_[0].host_logits for the last token position.
     void run_prefill(const std::vector<int32_t>& prompt_tokens) {
         const int seq_len = static_cast<int>(prompt_tokens.size());
@@ -1037,7 +1229,7 @@ private:
         for (int r = 0; r < NUM_GPUS; ++r) {
             threads.emplace_back(&InferenceEngine::run_gpu_decode, this,
                                  r, decode_state_.token_ids, decode_state_.positions,
-                                 decode_state_.slot_mapping, decode_state_.block_table,
+                                 decode_state_.slot_mapping, decode_state_.block_table.data(),
                                  decode_state_.seq_lens, 1, max_num_blocks);
         }
         for (auto& t : threads) t.join();
@@ -1047,20 +1239,23 @@ private:
     }
 
     // Convert BF16 device logits to FP32, then D2H copy to host_logits on GPU 0.
-    void convert_and_copy_logits() {
+    // num_seqs: number of sequences (1 for legacy single-sequence, B for batch)
+    void convert_and_copy_logits(int num_seqs = 1) {
         auto& gpu = gpus_[0];
         CUDA_CHECK(hipSetDevice(0));
 
         hipStream_t stream = transformer_compute_stream(gpu.model);
 
+        const int total_elements = num_seqs * ModelConfig::vocab_size;
+
         // BF16 -> FP32 conversion on device
         bf16_to_fp32(gpu.device_logits_bf16, gpu.device_logits_fp32,
-                     ModelConfig::vocab_size, stream);
+                     total_elements, stream);
 
         // Copy FP32 logits to pinned host memory
         CUDA_CHECK(hipMemcpyAsync(gpu.host_logits,
                                    gpu.device_logits_fp32,
-                                   ModelConfig::vocab_size * sizeof(float),
+                                   total_elements * sizeof(float),
                                    hipMemcpyDeviceToHost,
                                    stream));
         CUDA_CHECK(hipStreamSynchronize(stream));
@@ -1163,23 +1358,58 @@ private:
     // pre-allocated to the maximum possible size.
     // ------------------------------------------------------------------
     struct DecodeState {
-        static constexpr int MAX_BLOCKS =
-            (ModelConfig::rope_max_pos + ModelConfig::kv_block_size - 1) /
-            ModelConfig::kv_block_size;  // max blocks for longest sequence
+        static constexpr int MAX_BATCH = ModelConfig::max_batch_size; // 256
 
-        int32_t token_ids[1]     = {0};
-        int32_t positions[1]     = {0};
-        int32_t slot_mapping[1]  = {0};
-        int32_t seq_lens[1]      = {0};
-        int32_t block_table[MAX_BLOCKS];  // pre-filled with 0..MAX_BLOCKS-1
+        // blocks_per_seq: set dynamically based on actual KV cache capacity.
+        // The KV cache is [num_physical_blocks, ...] where physical blocks
+        // are split across layers. Each layer sees blocks_per_layer blocks.
+        // We divide that evenly among MAX_BATCH sequences.
+        int blocks_per_seq = 0;  // set by init(blocks_per_layer)
+
+        // B=1 legacy arrays (kept for backward compat)
+        int32_t token_ids[MAX_BATCH]     = {};
+        int32_t positions[MAX_BATCH]     = {};
+        int32_t slot_mapping[MAX_BATCH]  = {};
+        int32_t seq_lens[MAX_BATCH]      = {};
+
+        // Block table: [MAX_BATCH][blocks_per_seq]
+        // For batched decode, each sequence gets its own row of block IDs.
+        // Laid out contiguously: seq 0 blocks, seq 1 blocks, ...
+        std::vector<int32_t> block_table;
+
+        // Packed block table for decode: [num_seqs][max_num_blocks]
+        // (subset of block_table, packed for the transformer)
+        std::vector<int32_t> packed_block_table;
+
         int     last_num_blocks  = 0;     // track growth to avoid redundant init
 
-        void init() {
-            // Pre-fill block table with identity mapping (block i = physical block i).
-            // This only needs to happen once; subsequent decode steps just use
-            // a prefix of this array.
-            for (int b = 0; b < MAX_BLOCKS; ++b) {
-                block_table[b] = b;
+        int blocks_per_layer_ = 0;  // total blocks available per layer
+
+        void init(int blocks_per_layer) {
+            blocks_per_layer_ = blocks_per_layer;
+            // Default: B=1, full capacity for single sequence
+            blocks_per_seq = blocks_per_layer;
+            setup_block_table(1);
+        }
+
+        // Reconfigure block table for a specific batch size.
+        // Divides the per-layer KV cache evenly among B sequences.
+        void setup_block_table(int B) {
+            blocks_per_seq = blocks_per_layer_ / std::max(B, 1);
+            if (blocks_per_seq < 1) blocks_per_seq = 1;
+
+            int max_seq_tokens = blocks_per_seq * ModelConfig::kv_block_size;
+            fprintf(stderr, "[DecodeState] B=%d, blocks_per_layer=%d, blocks_per_seq=%d, "
+                    "max_seq_tokens=%d\n", B, blocks_per_layer_, blocks_per_seq, max_seq_tokens);
+
+            // Pre-fill block table with identity mapping per sequence.
+            // Sequence i uses blocks [i*blocks_per_seq, (i+1)*blocks_per_seq).
+            block_table.resize(static_cast<size_t>(B) * blocks_per_seq);
+            for (int s = 0; s < B; ++s) {
+                int base = s * blocks_per_seq;
+                for (int b = 0; b < blocks_per_seq; ++b) {
+                    block_table[base + b] = s * blocks_per_seq + b;
+                }
             }
             last_num_blocks = 0;
         }
@@ -1214,6 +1444,12 @@ std::vector<int32_t> inference_engine_generate(
     InferenceEngine* eng, const std::vector<int32_t>& prompt,
     int max_tokens, float temperature, float top_p) {
     return eng->generate(prompt, max_tokens, temperature, top_p);
+}
+
+std::vector<std::vector<int32_t>> inference_engine_generate_batch(
+    InferenceEngine* eng, const std::vector<std::vector<int32_t>>& prompts,
+    int max_tokens, float temperature, float top_p) {
+    return eng->generate_batch(prompts, max_tokens, temperature, top_p);
 }
 
 } // namespace gptoss

@@ -406,7 +406,8 @@ public:
         const int* token_ids_host,
         const int* positions_host,
         int seq_len,
-        __hip_bfloat16* logits_output)
+        __hip_bfloat16* logits_output,
+        const int32_t* slot_mapping_host = nullptr)
     {
         if (seq_len == 0 || !initialized_) return;
         if (seq_len > max_tokens_) {
@@ -425,6 +426,14 @@ public:
         CUDA_CHECK(hipMemcpyAsync(d_positions_, positions_host,
                                     seq_len * sizeof(int),
                                     hipMemcpyHostToDevice, stream));
+
+        // If slot_mapping provided, copy it to d_slot_mapping_; otherwise
+        // it will default to positions (identity) in the attention call below.
+        if (slot_mapping_host) {
+            CUDA_CHECK(hipMemcpyAsync(d_slot_mapping_, slot_mapping_host,
+                                        seq_len * sizeof(int32_t),
+                                        hipMemcpyHostToDevice, stream));
+        }
 
         // Step 1: Embedding lookup
         // residual_buf_[0] = embedding_table[token_ids]
@@ -448,13 +457,16 @@ public:
 
             // Attention sub-layer:
             //   dst_buf = src_buf + attention(src_buf)
-            // d_positions_ = [0..seq_len-1] = identity slot_mapping for KV cache
+            // Use explicit slot_mapping if provided, else identity (positions)
+            const int32_t* prefill_slot_map = slot_mapping_host
+                ? d_slot_mapping_
+                : reinterpret_cast<const int32_t*>(d_positions_);
             PROF("attention", "attn", device_id_, stream);
             attention_layer_prefill(
                 attention_layers_[layer],
                 residual_buf_[src_buf],
                 d_positions_,
-                reinterpret_cast<const int32_t*>(d_positions_),
+                prefill_slot_map,
                 residual_buf_[dst_buf],
                 seq_len,
                 stream);
@@ -834,8 +846,9 @@ void transformer_init(Transformer* t, int rank, ncclComm_t nccl_comm,
 
 void transformer_prefill(Transformer* t, const int* token_ids_host,
                           const int* positions_host, int seq_len,
-                          __hip_bfloat16* logits_output) {
-    t->prefill(token_ids_host, positions_host, seq_len, logits_output);
+                          __hip_bfloat16* logits_output,
+                          const int32_t* slot_mapping_host) {
+    t->prefill(token_ids_host, positions_host, seq_len, logits_output, slot_mapping_host);
 }
 
 void transformer_decode(Transformer* t, const int* token_ids_host,

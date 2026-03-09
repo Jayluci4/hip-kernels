@@ -56,6 +56,15 @@ extern "C" {
                                  int32_t* output_tokens,
                                  int output_capacity);
     int   gptoss_engine_is_initialized(void* engine);
+    int   gptoss_engine_generate_batch(void* engine,
+                                       const int32_t* prompts_flat,
+                                       int batch_size,
+                                       int prompt_len,
+                                       int max_tokens,
+                                       float temperature,
+                                       float top_p,
+                                       int32_t* output_flat,
+                                       int output_capacity);
 }
 
 // Python-facing wrapper that translates between pybind11 types and the
@@ -132,6 +141,50 @@ public:
         }
         output.resize(num_tokens);
         return output;
+    }
+
+    std::vector<std::vector<int32_t>> generate_batch(
+            const std::vector<std::vector<int32_t>>& prompts,
+            int max_tokens    = 512,
+            float temperature = 0.0f,
+            float top_p       = 1.0f) {
+        if (prompts.empty()) {
+            throw std::invalid_argument("prompts must not be empty");
+        }
+        int batch_size = static_cast<int>(prompts.size());
+        int prompt_len = static_cast<int>(prompts[0].size());
+        for (int i = 1; i < batch_size; ++i) {
+            if (static_cast<int>(prompts[i].size()) != prompt_len) {
+                throw std::invalid_argument("All prompts must have the same length");
+            }
+        }
+
+        // Flatten prompts into [batch_size * prompt_len]
+        std::vector<int32_t> flat(batch_size * prompt_len);
+        for (int i = 0; i < batch_size; ++i) {
+            std::memcpy(flat.data() + i * prompt_len,
+                        prompts[i].data(), prompt_len * sizeof(int32_t));
+        }
+
+        // Output buffer: packed [len, tokens...] per sequence
+        int out_cap = batch_size * (prompt_len + max_tokens + 1);
+        std::vector<int32_t> out_flat(out_cap);
+
+        int total = gptoss_engine_generate_batch(
+            engine_, flat.data(), batch_size, prompt_len,
+            max_tokens, temperature, top_p,
+            out_flat.data(), out_cap);
+
+        // Unpack results
+        std::vector<std::vector<int32_t>> results;
+        int offset = 0;
+        while (offset < total) {
+            int n = out_flat[offset++];
+            results.emplace_back(out_flat.begin() + offset,
+                                 out_flat.begin() + offset + n);
+            offset += n;
+        }
+        return results;
     }
 
     void shutdown() {
@@ -216,6 +269,30 @@ PYBIND11_MODULE(gptoss, m) {
              "Raises:\n"
              "    ValueError: If arguments are invalid.\n"
              "    RuntimeError: If the engine is not initialized or generation fails.")
+
+        .def("generate_batch",
+             [](gptoss::PyInferenceEngine& self,
+                const std::vector<std::vector<int32_t>>& prompts,
+                int max_tokens,
+                float temperature,
+                float top_p) -> std::vector<std::vector<int32_t>> {
+                 py::gil_scoped_release release;
+                 return self.generate_batch(prompts, max_tokens,
+                                            temperature, top_p);
+             },
+             py::arg("prompts"),
+             py::arg("max_tokens")   = 512,
+             py::arg("temperature")  = 0.0f,
+             py::arg("top_p")        = 1.0f,
+             "Generate tokens for a batch of prompts.\n\n"
+             "All prompts must have the same token length.\n\n"
+             "Args:\n"
+             "    prompts: List of List[int] prompt token sequences.\n"
+             "    max_tokens: Maximum new tokens per sequence (default 512).\n"
+             "    temperature: Sampling temperature; 0 = greedy (default 0).\n"
+             "    top_p: Nucleus sampling threshold (default 1.0).\n\n"
+             "Returns:\n"
+             "    List of List[int] (prompt + generated tokens per sequence).")
 
         .def("shutdown",
              [](gptoss::PyInferenceEngine& self) {
